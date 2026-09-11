@@ -46,10 +46,11 @@ func movePayload(ids ...string) Payload {
 // recordingExecutor captures what the drainer asked it to run, and can be told
 // to fail a given number of times first.
 type recordingExecutor struct {
-	mu       sync.Mutex
-	ran      []string
-	failFor  int
-	failWith error
+	mu          sync.Mutex
+	ran         []string
+	failFor     int
+	failWith    error
+	compensated []string
 }
 
 func (r *recordingExecutor) Execute(_ context.Context, op *Op) error {
@@ -62,6 +63,20 @@ func (r *recordingExecutor) Execute(_ context.Context, op *Op) error {
 	}
 	r.ran = append(r.ran, op.ID)
 	return nil
+}
+
+// Compensate records the abandonment so tests can assert the local half gets
+// rolled back rather than left diverged.
+func (r *recordingExecutor) Compensate(_ context.Context, op *Op, _ error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.compensated = append(r.compensated, op.ID)
+}
+
+func (r *recordingExecutor) compensations() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.compensated...)
 }
 
 func (r *recordingExecutor) runs() []string {
@@ -395,4 +410,103 @@ func TestBackoffGrowsAndCaps(t *testing.T) {
 	if got := backoffFor(100); got != maxBackoff {
 		t.Errorf("backoffFor(100) = %v, want the cap %v", got, maxBackoff)
 	}
+}
+
+// TestAbandonedOpIsCompensated is the correctness guarantee behind optimistic
+// UI: when an op can never reach the server, the executor is told so it can
+// walk the local change back. Without this the local store and the server
+// disagree permanently — an abandoned move leaves the message parked in the
+// destination locally while the server still has it in the source, and the
+// next sync surfaces it in both places.
+func TestAbandonedOpIsCompensated(t *testing.T) {
+	s := newTestStore(t)
+	exec := &recordingExecutor{failFor: 1, failWith: fmt.Errorf("%w: folder gone", ErrUnrecoverable)}
+	d := NewDrainer(s, exec, zerolog.Nop())
+
+	id, err := s.Enqueue("acct-1", TypeMove, movePayload("m1"), time.Now().Add(-time.Second))
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Start(ctx)
+	d.Wake()
+
+	waitForEmptyQueue(t, s)
+
+	comps := exec.compensations()
+	if len(comps) != 1 || comps[0] != id {
+		t.Errorf("compensations = %v, want [%s]", comps, id)
+	}
+	if runs := exec.runs(); len(runs) != 0 {
+		t.Errorf("executor reported %d successful runs, want 0", len(runs))
+	}
+}
+
+// TestSuccessfulOpIsNotCompensated: compensation is strictly the failure path.
+// Rolling back a move that actually landed would be a bug of its own.
+func TestSuccessfulOpIsNotCompensated(t *testing.T) {
+	s := newTestStore(t)
+	exec := &recordingExecutor{}
+	d := NewDrainer(s, exec, zerolog.Nop())
+
+	if _, err := s.Enqueue("acct-1", TypeMove, movePayload("m1"), time.Now()); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Start(ctx)
+	d.Wake()
+
+	waitForEmptyQueue(t, s)
+
+	if comps := exec.compensations(); len(comps) != 0 {
+		t.Errorf("compensated a successful op: %v", comps)
+	}
+}
+
+// TestRetriedOpIsNotCompensatedEarly: a transient failure must retry, not
+// compensate. Rolling back on the first hiccup would undo the user's action
+// because the server blinked.
+func TestRetriedOpIsNotCompensatedEarly(t *testing.T) {
+	s := newTestStore(t)
+	exec := &recordingExecutor{failFor: 1, failWith: errors.New("temporary network glitch")}
+	d := NewDrainer(s, exec, zerolog.Nop())
+
+	if _, err := s.Enqueue("acct-1", TypeMove, movePayload("m1"), time.Now().Add(-time.Second)); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Start(ctx)
+	d.Wake()
+
+	// First attempt fails and is rescheduled; nothing should be compensated.
+	time.Sleep(200 * time.Millisecond)
+	if comps := exec.compensations(); len(comps) != 0 {
+		t.Fatalf("compensated on a retryable failure: %v", comps)
+	}
+
+	op, err := s.Get(findOnlyOpID(t, s))
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if op == nil {
+		t.Fatal("retryable op was dropped instead of rescheduled")
+	}
+	if op.Attempt != 1 {
+		t.Errorf("attempt = %d, want 1", op.Attempt)
+	}
+}
+
+func findOnlyOpID(t *testing.T, s *Store) string {
+	t.Helper()
+	var id string
+	if err := s.db.QueryRow(`SELECT id FROM pending_ops LIMIT 1`).Scan(&id); err != nil {
+		t.Fatalf("find op: %v", err)
+	}
+	return id
 }

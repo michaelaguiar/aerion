@@ -328,3 +328,60 @@ func TestFilterIDsInFolder(t *testing.T) {
 		t.Errorf("FilterIDsInFolder(nil) = %v, %v; want nil, nil", got, err)
 	}
 }
+
+// TestRestoreParkedMessages_OnlyTouchesUntouchedRows covers the guard on the
+// compensation path. An abandoned move can be rolled back minutes after the
+// fact, by which time the user may have moved the message again or undone it
+// already. Only rows still parked from that move may be restored.
+func TestRestoreParkedMessages_OnlyTouchesUntouchedRows(t *testing.T) {
+	s, as, accountID, inboxID, trashID := newIdentityTestStore(t)
+	parked := seedFetchedMessage(t, s, as, accountID, inboxID)
+
+	// A second message the user has since moved on from.
+	movedOn := &Message{
+		ID: "msg-local-2", AccountID: accountID, FolderID: inboxID, UID: 43,
+		MessageID: "<second@example.com>", Date: time.Now().UTC(),
+	}
+	if err := s.Create(movedOn); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Both were trashed together...
+	if err := s.MoveMessages([]string{parked.ID, movedOn.ID}, trashID); err != nil {
+		t.Fatalf("MoveMessages: %v", err)
+	}
+	// ...but the second one has since been reconciled to a real UID (its move
+	// did reach the server), so it is no longer parked.
+	if _, err := s.db.Exec(`UPDATE messages SET uid = 500 WHERE id = ?`, movedOn.ID); err != nil {
+		t.Fatalf("simulate reconcile: %v", err)
+	}
+
+	entries := []FolderUID{
+		{ID: parked.ID, FolderID: inboxID, UID: 42},
+		{ID: movedOn.ID, FolderID: inboxID, UID: 43},
+	}
+	restored, err := s.RestoreParkedMessages(entries, trashID)
+	if err != nil {
+		t.Fatalf("RestoreParkedMessages: %v", err)
+	}
+	if restored != 1 {
+		t.Errorf("restored = %d, want 1 (only the still-parked row)", restored)
+	}
+
+	back, err := s.Get(parked.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if back.FolderID != inboxID || back.UID != 42 {
+		t.Errorf("parked message = folder %s uid %d, want %s/42", back.FolderID, back.UID, inboxID)
+	}
+
+	untouched, err := s.Get(movedOn.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if untouched.FolderID != trashID || untouched.UID != 500 {
+		t.Errorf("reconciled message was clobbered: folder %s uid %d, want %s/500",
+			untouched.FolderID, untouched.UID, trashID)
+	}
+}

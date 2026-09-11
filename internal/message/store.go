@@ -2136,6 +2136,53 @@ func (s *Store) RestoreMessages(entries []FolderUID) error {
 	return nil
 }
 
+// RestoreParkedMessages is RestoreMessages for the compensation path: it only
+// puts back rows that are still parked from the move being rolled back.
+//
+// A move can be abandoned minutes after it was made, and the user may have
+// acted on those messages since — moved them somewhere else, or undone the
+// move already. Restoring blindly would clobber that. The guard (still in the
+// destination folder, still at a negative UID) means only messages untouched
+// since the failed move are restored; anything else is left alone.
+//
+// Returns how many rows were actually restored.
+func (s *Store) RestoreParkedMessages(entries []FolderUID, parkedFolderID string) (int, error) {
+	if len(entries) == 0 {
+		return 0, nil
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("failed to begin restore: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	stmt, err := tx.Prepare(
+		`UPDATE messages SET folder_id = ?, uid = ?
+		 WHERE id = ? AND folder_id = ? AND uid < 0`,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("failed to prepare restore: %w", err)
+	}
+	defer stmt.Close()
+
+	restored := 0
+	for _, e := range entries {
+		res, err := stmt.Exec(e.FolderID, e.UID, e.ID, parkedFolderID)
+		if err != nil {
+			return 0, fmt.Errorf("failed to restore message %s: %w", e.ID, err)
+		}
+		if n, err := res.RowsAffected(); err == nil {
+			restored += int(n)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("failed to commit restore: %w", err)
+	}
+	return restored, nil
+}
+
 // DeleteTempUIDs removes messages with temporary negative UIDs in a folder.
 // These are left over after MoveMessages assigns -rowid as a placeholder UID.
 func (s *Store) DeleteTempUIDs(folderID string) error {
