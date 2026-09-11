@@ -13,6 +13,18 @@ import (
 // which owns the IMAP connection pool.
 type Executor interface {
 	Execute(ctx context.Context, op *Op) error
+
+	// Compensate is called when an op is abandoned — the server refused it, or
+	// it exhausted its retries — and will therefore never be applied.
+	//
+	// This is what keeps the local store honest. The local half of a mutation
+	// was applied optimistically the moment the user acted; if the server half
+	// can never follow, that optimism has to be walked back, or the two sides
+	// disagree permanently and the next sync surfaces the message in two
+	// places at once.
+	//
+	// Errors are logged, not retried: compensation is the last resort.
+	Compensate(ctx context.Context, op *Op, cause error)
 }
 
 // ErrUnrecoverable marks a failure that retrying cannot fix — a deleted
@@ -172,6 +184,8 @@ func (d *Drainer) run(ctx context.Context, op *Op) {
 		if aErr := d.store.Abandon(op.ID); aErr != nil {
 			d.log.Warn().Err(aErr).Str("op", op.ID).Msg("Failed to abandon op")
 		}
+		// Roll the local half back before anyone can observe the divergence.
+		d.exec.Compensate(ctx, op, err)
 		return
 	}
 

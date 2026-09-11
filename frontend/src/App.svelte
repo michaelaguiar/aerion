@@ -365,6 +365,20 @@
       showFlatpakFsDialog = true
     })
 
+    // A queued mailbox operation was abandoned — the server refused it, or it
+    // ran out of retries. The backend has already rolled back whatever local
+    // state it could; the user needs to hear about it rather than discover it
+    // when the message reappears.
+    EventsOn('ops:failed', (data: { op: string; messageCount: number; folderName: string; reverted: boolean }) => {
+      addToast({
+        type: 'error',
+        message: data.reverted
+          ? $_('toast.opFailedReverted', { values: { count: data.messageCount, folder: data.folderName } })
+          : $_('toast.opFailedResync'),
+      })
+      messageListRef?.handleActionComplete()
+    })
+
     // Listen for external mailto from second instance (routed through backend)
     EventsOn('mailto:external', (data: MailtoData) => {
       handleMailtoData(data)

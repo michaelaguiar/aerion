@@ -149,6 +149,93 @@ func (a *App) Execute(ctx context.Context, op *ops.Op) error {
 	}
 }
 
+// Compensate implements ops.Executor. Called when an op has been abandoned and
+// will never reach the server.
+//
+// Every mutation here applied to the local store first, on the assumption the
+// server would follow. When it can't, that assumption has to be withdrawn —
+// otherwise the local store and the server disagree permanently, and the next
+// sync makes it visible in the worst way: an abandoned move leaves the message
+// parked in the destination folder locally while the server still has it in
+// the source, so the next source-folder sync re-inserts it and the message
+// shows up in two places at once.
+func (a *App) Compensate(_ context.Context, op *ops.Op, cause error) {
+	log := logging.WithComponent("app.ops")
+
+	switch op.Type {
+	case ops.TypeMove:
+		a.compensateMove(op, cause)
+
+	case ops.TypeFlag, ops.TypeCopy, ops.TypeDelete:
+		// These self-heal. A flag the server never saw is corrected by the next
+		// sync; a copy that never happened simply isn't there; a permanent
+		// delete that never happened means the message comes back on sync,
+		// which is the truthful outcome. Tell the user rather than silently
+		// letting the state flip back under them.
+		log.Error().Err(cause).Str("op", op.Describe()).Msg("Op abandoned; local state will resync")
+		a.notifyOpFailed(op, cause, 0)
+
+	default:
+		log.Error().Err(cause).Str("op", op.Describe()).Msg("Op abandoned with no compensation path")
+	}
+}
+
+// compensateMove puts an abandoned move's messages back where they came from.
+func (a *App) compensateMove(op *ops.Op, cause error) {
+	log := logging.WithComponent("app.ops")
+
+	entries := make([]message.FolderUID, 0, len(op.Payload.Messages))
+	for _, m := range op.Payload.Messages {
+		entries = append(entries, message.FolderUID{
+			ID:       m.ID,
+			FolderID: op.Payload.SourceFolderID,
+			UID:      m.UID,
+		})
+	}
+
+	restored, err := a.messageStore.RestoreParkedMessages(entries, op.Payload.DestFolderID)
+	if err != nil {
+		log.Error().Err(err).Str("op", op.Describe()).Msg("Failed to roll back abandoned move")
+		return
+	}
+
+	log.Warn().Err(cause).
+		Str("op", op.Describe()).
+		Int("restored", restored).
+		Int("total", len(entries)).
+		Msg("Move abandoned; local rows rolled back to source folder")
+
+	if restored > 0 {
+		wailsRuntime.EventsEmit(a.ctx, "messages:moved", map[string]interface{}{
+			"messageIds":   op.Payload.MessageIDs(),
+			"destFolderId": op.Payload.SourceFolderID,
+		})
+		a.emitFolderCounts(op.Payload.SourceFolderID)
+		a.emitFolderCounts(op.Payload.DestFolderID)
+	}
+
+	a.notifyOpFailed(op, cause, restored)
+}
+
+// notifyOpFailed tells the frontend an action couldn't be completed, so the
+// user finds out from a message rather than from the message reappearing.
+func (a *App) notifyOpFailed(op *ops.Op, cause error, restored int) {
+	folderName := ""
+	if op.Payload.DestFolderID != "" {
+		if f, err := a.folderStore.Get(op.Payload.DestFolderID); err == nil && f != nil {
+			folderName = f.Name
+		}
+	}
+
+	wailsRuntime.EventsEmit(a.ctx, "ops:failed", map[string]interface{}{
+		"op":           string(op.Type),
+		"messageCount": len(op.Payload.Messages),
+		"folderName":   folderName,
+		"reverted":     restored > 0,
+		"error":        cause.Error(),
+	})
+}
+
 // execMoveOp performs the server half of a move, then resyncs the destination
 // so the moved messages pick up their real UIDs.
 func (a *App) execMoveOp(ctx context.Context, op *ops.Op) error {

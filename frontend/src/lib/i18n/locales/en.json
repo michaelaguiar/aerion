@@ -308,6 +308,8 @@
     "failedToSaveSettings": "Failed to save settings.",
     "failedToSave": "Failed to save.",
     "undoFailed": "Undo failed.",
+    "opFailedReverted": "Couldn't move {count, plural, one {the message} other {# messages}} to {folder} — the server rejected it, so {count, plural, one {it has} other {they have}} been put back.",
+    "opFailedResync": "Couldn't complete the last action on the server. It will be corrected on the next sync.",
     "failedToPrepare": "Failed to prepare {mode}. Opening blank composer.",
     "noAccountConfigured": "No email account configured. Please add an account first.",
     "movedTo": "Moved to {folder}",
