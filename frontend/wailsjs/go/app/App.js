@@ -198,6 +198,10 @@ export function CancelOAuthFlow() {
   return window['go']['app']['App']['CancelOAuthFlow']();
 }
 
+export function CancelPendingOp(arg1) {
+  return window['go']['app']['App']['CancelPendingOp'](arg1);
+}
+
 export function CheckRecipientCerts(arg1) {
   return window['go']['app']['App']['CheckRecipientCerts'](arg1);
 }
@@ -212,6 +216,10 @@ export function ClearOAuthCreds(arg1) {
 
 export function CloseWindow() {
   return window['go']['app']['App']['CloseWindow']();
+}
+
+export function Compensate(arg1, arg2, arg3) {
+  return window['go']['app']['App']['Compensate'](arg1, arg2, arg3);
 }
 
 export function CompleteContactSourceOAuthSetup(arg1, arg2) {
@@ -346,16 +354,16 @@ export function EmptyTrash(arg1, arg2) {
   return window['go']['app']['App']['EmptyTrash'](arg1, arg2);
 }
 
+export function Execute(arg1, arg2) {
+  return window['go']['app']['App']['Execute'](arg1, arg2);
+}
+
 export function FetchMessageBody(arg1) {
   return window['go']['app']['App']['FetchMessageBody'](arg1);
 }
 
 export function FetchServerMessage(arg1, arg2, arg3) {
   return window['go']['app']['App']['FetchServerMessage'](arg1, arg2, arg3);
-}
-
-export function FindLocalMessageIDs(arg1, arg2, arg3) {
-  return window['go']['app']['App']['FindLocalMessageIDs'](arg1, arg2, arg3);
 }
 
 export function ForceSyncContactSource(arg1) {
@@ -886,8 +894,8 @@ export function MoveLocalMessages(arg1, arg2) {
   return window['go']['app']['App']['MoveLocalMessages'](arg1, arg2);
 }
 
-export function MoveMessagesToFolder(arg1, arg2) {
-  return window['go']['app']['App']['MoveMessagesToFolder'](arg1, arg2);
+export function MoveMessagesToFolderWithoutUndo(arg1, arg2) {
+  return window['go']['app']['App']['MoveMessagesToFolderWithoutUndo'](arg1, arg2);
 }
 
 export function MoveToFolder(arg1, arg2) {
@@ -1000,6 +1008,14 @@ export function RemoveTrustedCertificate(arg1) {
 
 export function ReorderAccounts(arg1) {
   return window['go']['app']['App']['ReorderAccounts'](arg1);
+}
+
+export function ResolveMessagesInFolder(arg1, arg2, arg3, arg4) {
+  return window['go']['app']['App']['ResolveMessagesInFolder'](arg1, arg2, arg3, arg4);
+}
+
+export function RestoreMessages(arg1, arg2) {
+  return window['go']['app']['App']['RestoreMessages'](arg1, arg2);
 }
 
 export function SaveAllAttachments(arg1) {

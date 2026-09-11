@@ -91,3 +91,39 @@ func TestParseMailtoURL_NoAddress(t *testing.T) {
 		t.Errorf("Subject = %q, want %q", result.Subject, "Hello")
 	}
 }
+
+// TestNewAppInitializesConcurrencyMaps guards an ordering hazard that is
+// otherwise only reachable at runtime.
+//
+// The op drainer releases operations stranded by a previous run and starts
+// executing them as soon as it is started. Those run the full mutation path —
+// moveMessagesToIMAP calls noteOwnExpunge, which writes to ownExpungeAt. When
+// these maps were built partway through Startup, a drainer started before that
+// point panicked with "assignment to entry in nil map" on the first launch
+// after any pending operation was left behind.
+//
+// Building them with the App removes the ordering question entirely, and this
+// test fails if they ever drift back into Startup.
+func TestNewAppInitializesConcurrencyMaps(t *testing.T) {
+	a := NewApp(func() bool { return false }, false)
+
+	maps := map[string]bool{
+		"syncContexts":      a.syncContexts == nil,
+		"syncLastRequest":   a.syncLastRequest == nil,
+		"ownFlagChangeAt":   a.ownFlagChangeAt == nil,
+		"ownExpungeAt":      a.ownExpungeAt == nil,
+		"draftSyncContexts": a.draftSyncContexts == nil,
+		"draftSyncDone":     a.draftSyncDone == nil,
+	}
+	for name, isNil := range maps {
+		if isNil {
+			t.Errorf("NewApp left %s nil; a background worker writing to it will panic", name)
+		}
+	}
+
+	// The write that actually panicked, exercised directly.
+	a.noteOwnExpunge("acct-1")
+	if !a.recentOwnExpunge("acct-1") {
+		t.Error("noteOwnExpunge did not record the account")
+	}
+}

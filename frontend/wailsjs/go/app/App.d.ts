@@ -5,11 +5,12 @@ import {account} from '../models';
 import {carddav} from '../models';
 import {backend} from '../models';
 import {v1} from '../models';
+import {context} from '../models';
+import {ops} from '../models';
 import {app} from '../models';
 import {message} from '../models';
 import {folder} from '../models';
 import {contact} from '../models';
-import {context} from '../models';
 import {smtp} from '../models';
 import {imap} from '../models';
 import {settings} from '../models';
@@ -18,6 +19,7 @@ import {smime} from '../models';
 import {appstate} from '../models';
 import {sync} from '../models';
 import {draft} from '../models';
+import {undo} from '../models';
 
 export function AcceptCertificate(arg1:string,arg2:certificate.CertificateInfo,arg3:boolean):Promise<void>;
 
@@ -117,6 +119,8 @@ export function CancelFolderSync(arg1:string,arg2:string):Promise<void>;
 
 export function CancelOAuthFlow():Promise<void>;
 
+export function CancelPendingOp(arg1:string):Promise<boolean>;
+
 export function CheckRecipientCerts(arg1:Array<string>):Promise<Record<string, boolean>>;
 
 export function CheckRecipientPGPKeys(arg1:Array<string>):Promise<Record<string, boolean>>;
@@ -124,6 +128,8 @@ export function CheckRecipientPGPKeys(arg1:Array<string>):Promise<Record<string,
 export function ClearOAuthCreds(arg1:string):Promise<void>;
 
 export function CloseWindow():Promise<void>;
+
+export function Compensate(arg1:context.Context,arg2:ops.Op,arg3:Error):Promise<void>;
 
 export function CompleteContactSourceOAuthSetup(arg1:string,arg2:number):Promise<carddav.Source>;
 
@@ -191,11 +197,11 @@ export function DownloadEncryptedAttachment(arg1:string,arg2:string,arg3:string)
 
 export function EmptyTrash(arg1:string,arg2:string):Promise<void>;
 
+export function Execute(arg1:context.Context,arg2:ops.Op):Promise<void>;
+
 export function FetchMessageBody(arg1:string):Promise<message.Message>;
 
 export function FetchServerMessage(arg1:string,arg2:string,arg3:number):Promise<message.Message>;
-
-export function FindLocalMessageIDs(arg1:string,arg2:string,arg3:Array<string>):Promise<Array<string>>;
 
 export function ForceSyncContactSource(arg1:string):Promise<void>;
 
@@ -461,7 +467,7 @@ export function MarkAsUnread(arg1:Array<string>):Promise<void>;
 
 export function MoveLocalMessages(arg1:Array<string>,arg2:string):Promise<void>;
 
-export function MoveMessagesToFolder(arg1:Array<string>,arg2:string):Promise<void>;
+export function MoveMessagesToFolderWithoutUndo(arg1:Array<string>,arg2:string):Promise<void>;
 
 export function MoveToFolder(arg1:Array<string>,arg2:string):Promise<void>;
 
@@ -518,6 +524,10 @@ export function RemoveSpellcheckCustomWord(arg1:string):Promise<void>;
 export function RemoveTrustedCertificate(arg1:string):Promise<void>;
 
 export function ReorderAccounts(arg1:Array<string>):Promise<void>;
+
+export function ResolveMessagesInFolder(arg1:string,arg2:string,arg3:Array<string>,arg4:Array<string>):Promise<Array<string>>;
+
+export function RestoreMessages(arg1:Array<undo.MessageUID>,arg2:string):Promise<void>;
 
 export function SaveAllAttachments(arg1:string):Promise<string>;
 
