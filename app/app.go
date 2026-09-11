@@ -539,15 +539,12 @@ func (a *App) Preflight() error {
 // succeed inside a narrow window after the destination sync.
 const undoRetention = 5 * time.Minute
 
-// opFlushTimeout bounds how long shutdown waits for queued mailbox operations
-// to reach the server. Anything still queued past this survives in the
-// database and runs at next startup, so the cost of giving up is delay, not
-// data loss.
-const opFlushTimeout = 5 * time.Second
-
-// opStopTimeout bounds the wait for the background drain loop to finish
-// whatever it is in the middle of before the flush takes over.
-const opStopTimeout = 3 * time.Second
+// opStopTimeout bounds how long shutdown waits for an in-flight mailbox
+// operation to finish before giving up on it. Short on purpose: anything
+// unfinished is still queued in the database and runs at next launch, so the
+// cost of not waiting is a brief delay in reaching the server, while the cost
+// of waiting is a window that will not go away.
+const opStopTimeout = 1 * time.Second
 
 // emitUI delivers a Wails event to the frontend, unless the webview is already
 // gone.
@@ -1057,32 +1054,40 @@ func (a *App) InitiateShutdown() {
 func (a *App) Shutdown(ctx context.Context) {
 	log := logging.WithComponent("app")
 
-	// Nothing may reach the frontend from here on: the webview is being
-	// destroyed, and the shutdown flush below deliberately runs work that would
-	// otherwise emit. See emitUI.
+	// Nothing may reach the frontend from here on: the webview is already being
+	// destroyed by Quit. See emitUI.
 	a.uiTornDown.Store(true)
 
-	// Flush queued mutations before anything is torn down. A move or delete
-	// sitting in its defer window has already been applied locally and shown to
-	// the user; dropping it on exit would let the next sync resurrect the
-	// message. Bounded so a dead server can't block quitting.
+	// Shutdown should feel instant, and every step below can in principle block
+	// on the network, on D-Bus, or on disk. Timing each one means a slow quit
+	// can be attributed from a log rather than guessed at.
+	shutdownStart := time.Now()
+	lastStep := shutdownStart
+	step := func(what string) {
+		now := time.Now()
+		log.Debug().Str("step", what).Dur("took", now.Sub(lastStep)).Msg("Shutdown step")
+		lastStep = now
+	}
+
+	// Stop the drain loop. Deliberately no flush: quitting must not wait on the
+	// network.
+	//
+	// The queue is in SQLite, so a mutation that has not reached the server is
+	// already durable — Start releases and retries it on the next launch. That
+	// is the whole point of the outbox, and it makes a shutdown flush
+	// redundant. Flushing here cost seconds on every quit to buy nothing except
+	// a narrower window in which another device could see a message that this
+	// one has already moved.
+	//
+	// Stop gives an operation already in flight a moment to finish rather than
+	// tearing the connection out from under it; if it does not, the op stays
+	// queued and runs at next launch like any other.
 	if a.opDrainer != nil {
-		// Stop the background loop first so the flush is the only thing
-		// executing ops; two of them racing for the IMAP pool is the last
-		// thing a process trying to exit needs.
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), opStopTimeout)
 		a.opDrainer.Stop(stopCtx)
 		stopCancel()
-
-		if n, err := a.opStore.PendingCount(); err == nil && n > 0 {
-			log.Info().Int("count", n).Msg("Flushing queued mailbox operations before shutdown")
-			flushCtx, cancel := context.WithTimeout(context.Background(), opFlushTimeout)
-			if err := a.opDrainer.Flush(flushCtx); err != nil {
-				log.Warn().Err(err).Msg("Queued operations remain; they will run at next startup")
-			}
-			cancel()
-		}
 	}
+	step("drain loop")
 
 	// Broadcast shutdown to all composer windows
 	if a.ipcServer != nil {
@@ -1101,18 +1106,21 @@ func (a *App) Shutdown(ctx context.Context) {
 		_ = a.ipcServer.Stop()
 		log.Info().Msg("IPC server stopped")
 	}
+	step("composer windows")
 
 	// Stop email sync scheduler
 	if a.syncScheduler != nil {
 		a.syncScheduler.Stop()
 		log.Info().Msg("Email sync scheduler stopped")
 	}
+	step("sync scheduler")
 
 	// Stop IDLE manager
 	if a.idleManager != nil {
 		a.idleManager.Stop()
 		log.Info().Msg("IDLE manager stopped")
 	}
+	step("IDLE manager")
 
 	// Stop sleep/wake monitor
 	if a.sleepWakeMonitor != nil {
@@ -1137,25 +1145,29 @@ func (a *App) Shutdown(ctx context.Context) {
 		a.notifier.Stop()
 		log.Info().Msg("Notification listener stopped")
 	}
+	step("monitors + notifier")
 
 	// Stop CardDAV scheduler
 	if a.carddavScheduler != nil {
 		a.carddavScheduler.Stop()
 		log.Info().Msg("CardDAV scheduler stopped")
 	}
+	step("CardDAV scheduler")
 
 	// Close all IMAP connections
 	if a.imapPool != nil {
 		a.imapPool.CloseAll()
 		log.Info().Msg("IMAP connections closed")
 	}
+	step("IMAP pool")
 
 	if a.db != nil {
 		a.db.Close()
 		log.Info().Msg("Database closed")
 	}
+	step("database")
 
-	log.Info().Msg("Aerion shutdown complete")
+	log.Info().Dur("took", time.Since(shutdownStart)).Msg("Aerion shutdown complete")
 }
 
 // updateDBConnectionPool scales the database connection pool based on account count.
