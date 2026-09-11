@@ -43,7 +43,7 @@
   import { dispatchExtensionShortcut } from '$lib/stores/extensionShortcuts.svelte'
   import { initLayout, getLayoutMode, getResponsiveView, showViewer, hideViewer, showSidebar, hideSidebar, isResponsive } from '$lib/stores/layout.svelte'
   // @ts-ignore - wailsjs path
-  import { PrepareReply, GetPendingMailto, GetDraft, MarkAsRead, MarkAsUnread, Star, Unstar, Archive, MarkAsSpam, MarkAsNotSpam, Undo, GetTermsAccepted, SetTermsAccepted, RefreshWindowConstraints, AcceptCertificate, GetStartHiddenActive, CloseWindow, QuitApp, OpenComposerWindow, GetSystemTheme, NotifyStartupComplete, GetOAuthBuildStatus, GetOAuthWarningDisabled, SetOAuthWarningDisabled, GetLastSeenVersion, SetLastSeenVersion, GetAppInfo } from '../wailsjs/go/app/App.js'
+  import { PrepareReply, GetPendingMailto, GetDraft, MarkAsRead, MarkAsUnread, Star, Unstar, Archive, MarkAsSpam, MarkAsNotSpam, Undo, CanUndo, GetTermsAccepted, SetTermsAccepted, RefreshWindowConstraints, AcceptCertificate, GetStartHiddenActive, CloseWindow, QuitApp, OpenComposerWindow, GetSystemTheme, NotifyStartupComplete, GetOAuthBuildStatus, GetOAuthWarningDisabled, SetOAuthWarningDisabled, GetLastSeenVersion, SetLastSeenVersion, GetAppInfo } from '../wailsjs/go/app/App.js'
   // @ts-ignore - wailsjs path
   import { smtp, folder, certificate } from '../wailsjs/go/models'
   // @ts-ignore - wailsjs runtime
@@ -1080,6 +1080,15 @@
             }
           }
           return
+        case 'z':
+          // Ctrl/Cmd+Z — undo last action (trash/archive/spam/move-to-folder).
+          // Guarded on inInput so native text undo still works in search /
+          // composer / any input field (the Ctrl block has no global inInput
+          // guard, so this must stay per-case).
+          if (inInput) return
+          e.preventDefault()
+          handleUndo()
+          return
       }
       return
     }
@@ -1545,6 +1554,9 @@
   }
 
   async function handleUndo() {
+    // Silent no-op when the undo stack is empty (e.g. Ctrl+Z with nothing to
+    // undo) instead of surfacing an error toast.
+    if (!(await CanUndo())) return
     try {
       const description = await Undo()
       addToast({ type: 'success', message: $_('toast.undone', { values: { description } }) })

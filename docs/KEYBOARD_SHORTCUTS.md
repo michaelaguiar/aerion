@@ -13,6 +13,7 @@ These shortcuts work anywhere in the application (unless in composer).
 | `Ctrl+Q` | Quit application |
 | `Ctrl+N` | Compose new message |
 | `Ctrl+S` | Focus search bar |
+| `Ctrl+Z` | Undo last action (trash / archive / spam / move-to-folder) |
 | `Ctrl+Shift+A` | Sync all accounts |
 | `Ctrl+Shift+S` | Sync selected folder |
 | `Ctrl+Tab` | Switch to next extension on the rail (Mail / Contacts / ...) |
@@ -189,6 +190,7 @@ OTHER
   Ctrl + Shift + A    Sync all accounts
   Ctrl + Shift + S    Sync selected folder
   Ctrl + S            Search
+  Ctrl + Z            Undo last action
   Ctrl + L            Load images
   Ctrl + Q            Quit
   Escape              Clear/Close
