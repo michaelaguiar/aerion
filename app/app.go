@@ -372,6 +372,18 @@ func NewApp(debugModeFn func() bool, useDirectDBus bool) *App {
 	return &App{
 		debugMode:     debugModeFn,
 		useDirectDBus: useDirectDBus,
+
+		// Built here rather than partway through Startup. Background workers
+		// touch these, and the op drainer in particular can execute a
+		// mutation persisted by a previous run before Startup has finished
+		// wiring everything up — a nil map there is a panic, not a bug that
+		// waits to be noticed.
+		syncContexts:      make(map[string]context.CancelFunc),
+		syncLastRequest:   make(map[string]time.Time),
+		ownFlagChangeAt:   make(map[string]time.Time),
+		ownExpungeAt:      make(map[string]time.Time),
+		draftSyncContexts: make(map[string]context.CancelFunc),
+		draftSyncDone:     make(map[string]chan struct{}),
 	}
 }
 
@@ -763,7 +775,10 @@ func (a *App) Startup(ctx context.Context) {
 	// by a previous run are released and retried at startup.
 	a.opStore = ops.NewStore(db)
 	a.opDrainer = ops.NewDrainer(a.opStore, a, logging.WithComponent("app.ops"))
-	a.opDrainer.Start(ctx)
+	// Started at the end of Startup, not here: Start releases ops stranded by
+	// a previous run and begins executing them immediately, and those run
+	// against the full app — IMAP pool, sync engine, folder store. Enqueueing
+	// before then is safe; the drainer picks it up when it starts.
 
 	// OAuth2 manager was constructed earlier (before the Auth Broker, which
 	// captures it). See the earlier guarded init above for the rationale.
@@ -805,13 +820,8 @@ func (a *App) Startup(ctx context.Context) {
 	// Initialize FTS indexer for full-text search
 	a.ftsIndexer = message.NewFTSIndexer(db.DB)
 
-	// Initialize sync context tracking for cancel-and-restart
-	a.syncContexts = make(map[string]context.CancelFunc)
-	a.syncLastRequest = make(map[string]time.Time)
-	a.ownFlagChangeAt = make(map[string]time.Time)
-	a.ownExpungeAt = make(map[string]time.Time)
-	a.draftSyncContexts = make(map[string]context.CancelFunc)
-	a.draftSyncDone = make(map[string]chan struct{})
+	// Sync context tracking, IDLE echo suppression and draft sync maps are
+	// constructed in NewApp — see the comment there.
 
 	// IMPORTANT: backend-ready signal. The frontend's main.ts waits for the
 	// "app:ready" event (with IsReady() as a one-shot fallback) and will NOT
@@ -883,6 +893,11 @@ func (a *App) Startup(ctx context.Context) {
 
 	// Initialize autostart manager
 	a.autostartMgr = platform.NewAutostartManager()
+
+	// Everything the executor touches is wired now, so it is safe to start
+	// draining. This also releases and retries ops stranded by a previous run,
+	// which execute against the full app immediately.
+	a.opDrainer.Start(ctx)
 
 	log.Info().Msg("Aerion started successfully")
 }
