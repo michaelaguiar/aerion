@@ -1,7 +1,6 @@
 package app
 
 import (
-	"context"
 	"fmt"
 	"time"
 
@@ -10,6 +9,7 @@ import (
 	"github.com/hkdb/aerion/internal/imap"
 	"github.com/hkdb/aerion/internal/logging"
 	"github.com/hkdb/aerion/internal/message"
+	"github.com/hkdb/aerion/internal/ops"
 	"github.com/hkdb/aerion/internal/undo"
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
@@ -147,24 +147,10 @@ func (a *App) setReadStatus(messageIDs []string, isRead bool) error {
 		}
 	}()
 
-	// Sync to IMAP in background with retry
-	go func() {
-		defer recoverPanic("app.actions", "sync flags to IMAP")
-		for folderID, msgs := range byFolder {
-			var err error
-			for attempt := 1; attempt <= 3; attempt++ {
-				err = a.syncFlagsToIMAP(msgs, folderID, "read", isRead)
-				if err == nil {
-					break
-				}
-				log.Warn().Err(err).Int("attempt", attempt).Str("folderID", folderID).Msg("Failed to sync read flags to IMAP, retrying...")
-				time.Sleep(time.Duration(attempt) * time.Second)
-			}
-			if err != nil {
-				log.Error().Err(err).Str("folderID", folderID).Msg("Failed to sync read flags to IMAP after 3 attempts")
-			}
-		}
-	}()
+	// Queue the server half. Retry and backoff are the drainer's job now, and
+	// the op survives a quit — previously a flag change whose goroutine hadn't
+	// run yet was simply lost.
+	a.enqueueFlagOps(byFolder, "read", isRead)
 
 	// Read-flag changes are intentionally NOT pushed onto the undo stack.
 	// The original design treated every mark-read/unread as undoable, but
@@ -189,8 +175,6 @@ func (a *App) Unstar(messageIDs []string) error {
 }
 
 func (a *App) setStarredStatus(messageIDs []string, isStarred bool) error {
-	log := logging.WithComponent("app")
-
 	if len(messageIDs) == 0 {
 		return nil
 	}
@@ -219,24 +203,8 @@ func (a *App) setStarredStatus(messageIDs []string, isStarred bool) error {
 		"isStarred":  isStarred,
 	})
 
-	// Sync to IMAP in background with retry
-	go func() {
-		defer recoverPanic("app.actions", "sync star flags to IMAP")
-		for folderID, msgs := range byFolder {
-			var err error
-			for attempt := 1; attempt <= 3; attempt++ {
-				err = a.syncFlagsToIMAP(msgs, folderID, "starred", isStarred)
-				if err == nil {
-					break
-				}
-				log.Warn().Err(err).Int("attempt", attempt).Str("folderID", folderID).Msg("Failed to sync starred flags to IMAP, retrying...")
-				time.Sleep(time.Duration(attempt) * time.Second)
-			}
-			if err != nil {
-				log.Error().Err(err).Str("folderID", folderID).Msg("Failed to sync starred flags to IMAP after 3 attempts")
-			}
-		}
-	}()
+	// Queue the server half; see setReadStatus.
+	a.enqueueFlagOps(byFolder, "starred", isStarred)
 
 	// Star changes are intentionally NOT pushed onto the undo stack. Same
 	// rationale as setReadStatus: the cost of stack pollution outweighs
@@ -424,73 +392,30 @@ func (a *App) moveToFolder(messageIDs []string, destFolderID string, recordUndo 
 	// so that back-to-back moves to the same folder are serialized — the second call
 	// cancels the first and starts fresh, preventing the first sync from deleting
 	// locally-moved messages whose IMAP COPY hasn't completed yet.
-	// Closed once the IMAP move and the destination sync have finished, so an
-	// undo can wait for the message to have a real server UID before trying to
-	// move it back. Closed on every exit path, including IMAP failure — a
-	// failed move must not wedge undo forever.
-	moveSettled := make(chan struct{})
-
-	go func() {
-		defer recoverPanic("app.actions", "move messages on IMAP")
-		defer close(moveSettled)
-		for sourceFolderID, msgs := range byFolder {
-			if err := a.moveMessagesToIMAP(msgs, sourceFolderID, destFolder); err != nil {
-				log.Error().Err(err).
-					Str("sourceFolderID", sourceFolderID).
-					Str("destFolderID", destFolderID).
-					Msg("Failed to move messages on IMAP")
-				return
-			}
-		}
-
-		// Sync destination folder so moved messages get correct UIDs (headers + bodies).
-		// Clear the debounce timestamp so this request isn't silently dropped.
-		if len(messages) > 0 {
-			accountID := messages[0].AccountID
-			syncKey := accountID + ":" + destFolderID
-			a.syncMu.Lock()
-			delete(a.syncLastRequest, syncKey)
-			a.syncMu.Unlock()
-
-			syncErr := a.SyncFolder(accountID, destFolderID)
-			if syncErr != nil && syncErr != context.Canceled {
-				log.Warn().Err(syncErr).Str("destFolderID", destFolderID).Msg("Failed to sync destination folder after move")
-			}
-
-			// Clean up whatever is still parked at a negative UID. The sync
-			// above rebinds every message it can match by Message-ID, so this
-			// now only reaps rows that couldn't be reconciled (no Message-ID
-			// header, or the server never reported the copy).
-			//
-			// Skipped when the sync failed: the parked row is the only local
-			// copy of that message, along with its body and attachments.
-			// Leaving it in place costs a stale row until the next successful
-			// sync reconciles it; deleting it throws the message away.
-			if syncErr == nil {
-				if err := a.messageStore.DeleteTempUIDs(destFolderID); err != nil {
-					log.Warn().Err(err).Str("destFolderID", destFolderID).Msg("Failed to clean up temp UIDs after move")
-				}
-			}
-		}
-	}()
-
-	if !recordUndo {
-		return nil
-	}
-
-	// Wait for the move to reach the server before reversing it. Bounded so a
-	// stalled sync fails the undo with a message instead of hanging the UI.
-	settled := func() error {
-		select {
-		case <-moveSettled:
-			return nil
-		case <-time.After(moveSettleTimeout):
-			return fmt.Errorf("timed out after %s waiting for the move to reach the server", moveSettleTimeout)
-		}
-	}
-
-	// Create undo command for each source folder
+	// Queue the server half, one op per source folder. The drainer sends it
+	// after opDeferWindow, which is the window in which an undo is a pure
+	// local cancel rather than a reversal.
 	for sourceFolderID, msgs := range byFolder {
+		opID, err := a.enqueueOp(msgs[0].AccountID, ops.TypeMove, ops.Payload{
+			Messages:       opRefs(msgs),
+			SourceFolderID: sourceFolderID,
+			DestFolderID:   destFolderID,
+		})
+		if err != nil {
+			// The local move already happened and the user has seen it. Failing
+			// to record the server half would leave the two permanently out of
+			// step, so put the local rows back rather than lying about it.
+			log.Error().Err(err).Str("sourceFolderID", sourceFolderID).Msg("Failed to queue move, reverting local move")
+			if rErr := a.restoreMessages(msgs, sourceFolderID); rErr != nil {
+				log.Error().Err(rErr).Msg("Failed to revert local move")
+			}
+			return fmt.Errorf("failed to queue move: %w", err)
+		}
+
+		if !recordUndo {
+			continue
+		}
+
 		localIDs := make([]string, 0, len(msgs))
 		rfc822IDs := make([]string, 0, len(msgs))
 		for _, m := range msgs {
@@ -513,12 +438,38 @@ func (a *App) moveToFolder(messageIDs []string, destFolderID string, recordUndo 
 			sourceFolderID,
 			destFolderID,
 			fmt.Sprintf("Move to %s", destFolder.Name),
-			settled,
+			opID,
+			undoOriginals(msgs),
 		)
 		a.undoStack.Push(cmd)
 	}
 
 	return nil
+}
+
+// restoreMessages puts messages back in folderID with the UIDs they had before
+// a move, undoing the local half of MoveMessages.
+func (a *App) restoreMessages(msgs []*message.Message, folderID string) error {
+	entries := make([]message.FolderUID, 0, len(msgs))
+	for _, m := range msgs {
+		entries = append(entries, message.FolderUID{ID: m.ID, FolderID: folderID, UID: m.UID})
+	}
+	if err := a.messageStore.RestoreMessages(entries); err != nil {
+		return err
+	}
+	wailsRuntime.EventsEmit(a.ctx, "messages:moved", map[string]interface{}{
+		"messageIds":   messageIDsOf(msgs),
+		"destFolderId": folderID,
+	})
+	return nil
+}
+
+func messageIDsOf(msgs []*message.Message) []string {
+	ids := make([]string, 0, len(msgs))
+	for _, m := range msgs {
+		ids = append(ids, m.ID)
+	}
+	return ids
 }
 
 // isGmailAccount checks if the account uses Gmail's IMAP server.
@@ -700,32 +651,18 @@ func (a *App) CopyToFolder(messageIDs []string, destFolderID string) error {
 	}
 
 	// Copy on IMAP (no local DB change - messages stay in source folder)
-	go func() {
-		defer recoverPanic("app.actions", "copy messages on IMAP")
-		for sourceFolderID, msgs := range byFolder {
-			if err := a.copyMessagesToIMAP(msgs, sourceFolderID, destFolder); err != nil {
-				log.Error().Err(err).
-					Str("sourceFolderID", sourceFolderID).
-					Str("destFolderID", destFolderID).
-					Msg("Failed to copy messages on IMAP")
-			}
+	for sourceFolderID, msgs := range byFolder {
+		if _, err := a.enqueueOp(msgs[0].AccountID, ops.TypeCopy, ops.Payload{
+			Messages:       opRefs(msgs),
+			SourceFolderID: sourceFolderID,
+			DestFolderID:   destFolderID,
+		}); err != nil {
+			log.Error().Err(err).
+				Str("sourceFolderID", sourceFolderID).
+				Str("destFolderID", destFolderID).
+				Msg("Failed to queue copy")
 		}
-
-		// Sync destination folder so copied messages appear (headers + bodies)
-		// Clear debounce so this request isn't silently dropped
-		if len(messages) > 0 {
-			accountID := messages[0].AccountID
-			syncKey := accountID + ":" + destFolderID
-			a.syncMu.Lock()
-			delete(a.syncLastRequest, syncKey)
-			a.syncMu.Unlock()
-
-			if err := a.SyncFolder(accountID, destFolderID); err != nil && err != context.Canceled {
-				log.Warn().Err(err).Str("destFolderID", destFolderID).Msg("Failed to sync destination folder after copy")
-			}
-		}
-		// Dest folder refresh + sidebar count bump ride on folder:synced from SyncFolder above.
-	}()
+	}
 
 	return nil
 }
@@ -1205,15 +1142,17 @@ func (a *App) DeletePermanently(messageIDs []string) error {
 		}
 	}()
 
-	// Delete from IMAP in background
-	go func() {
-		defer recoverPanic("app.actions", "delete from IMAP")
-		for folderID, msgs := range byFolder {
-			if err := a.deleteMessagesFromIMAP(msgs, folderID); err != nil {
-				log.Error().Err(err).Str("folderID", folderID).Msg("Failed to delete messages from IMAP")
-			}
+	// Queue the server half. A permanent delete that never reached the server
+	// used to be resurrected by the next sync; queued, it survives a quit and
+	// retries until it lands.
+	for folderID, msgs := range byFolder {
+		if _, err := a.enqueueOp(msgs[0].AccountID, ops.TypeDelete, ops.Payload{
+			Messages:       opRefs(msgs),
+			SourceFolderID: folderID,
+		}); err != nil {
+			log.Error().Err(err).Str("folderID", folderID).Msg("Failed to queue permanent delete")
 		}
-	}()
+	}
 
 	// Note: Permanent delete undo is complex - would need to store full message content
 	// For now, we don't add to undo stack for permanent deletes

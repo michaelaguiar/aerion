@@ -1337,4 +1337,49 @@ var migrations = []Migration{
 			ALTER TABLE accounts ADD COLUMN imap_auth_mechanism TEXT NOT NULL DEFAULT 'auto';
 		`,
 	},
+	{
+		Version: 43,
+		SQL: `
+			-- Durable outbox for mailbox mutations. Actions apply to the local
+			-- store immediately and enqueue the server half here; a drainer
+			-- executes them against IMAP. Mirrors the calendar extension's
+			-- pending_writes table.
+			--
+			-- Three things this buys that a bare goroutine could not:
+			--   * Undo of a still-pending op is a local cancel — no network,
+			--     no waiting for a round trip that hasn't happened.
+			--   * Ops survive quit and crash instead of silently evaporating
+			--     and letting the next sync resurrect a deleted message.
+			--   * Working offline queues instead of failing.
+			--
+			-- state: pending -> running -> (deleted on success | failed).
+			-- failed rows stay for retry with backoff; attempt/last_error carry
+			-- the history.
+			--
+			-- not_before_unix defers execution briefly after enqueue, which is
+			-- what makes a reflexive undo a cancel rather than a reversal.
+			--
+			-- payload_json holds the op-specific arguments, including the
+			-- pre-move UIDs a move needs to address messages on the server
+			-- after the local rows have already been reparked.
+
+			CREATE TABLE IF NOT EXISTS pending_ops (
+				id                TEXT PRIMARY KEY,
+				account_id        TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+				op                TEXT NOT NULL,
+				payload_json      TEXT NOT NULL,
+				state             TEXT NOT NULL DEFAULT 'pending',
+				not_before_unix   INTEGER NOT NULL,
+				attempt           INTEGER NOT NULL DEFAULT 0,
+				last_attempt_unix INTEGER,
+				last_error        TEXT,
+				created_unix      INTEGER NOT NULL
+			);
+
+			CREATE INDEX IF NOT EXISTS idx_pending_ops_drain
+				ON pending_ops(account_id, state, not_before_unix);
+			CREATE INDEX IF NOT EXISTS idx_pending_ops_seq
+				ON pending_ops(created_unix);
+		`,
+	},
 }

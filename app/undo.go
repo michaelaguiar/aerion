@@ -5,6 +5,8 @@ import (
 	"fmt"
 
 	"github.com/hkdb/aerion/internal/imap"
+	"github.com/hkdb/aerion/internal/message"
+	"github.com/hkdb/aerion/internal/undo"
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
@@ -188,6 +190,35 @@ func (a *App) ResolveMessagesInFolder(accountID, folderID string, localIDs, rfc8
 		}
 	}
 	return resolved, nil
+}
+
+// CancelPendingOp implements undo.UndoContext.
+func (a *App) CancelPendingOp(opID string) (bool, error) {
+	return a.cancelOp(opID)
+}
+
+// RestoreMessages implements undo.UndoContext.
+//
+// Only reached when the move's server op was cancelled before it ran, so the
+// messages still carry these UIDs on the server and putting them back is a
+// purely local edit.
+func (a *App) RestoreMessages(originals []undo.MessageUID, folderID string) error {
+	entries := make([]message.FolderUID, 0, len(originals))
+	ids := make([]string, 0, len(originals))
+	for _, o := range originals {
+		entries = append(entries, message.FolderUID{ID: o.ID, FolderID: folderID, UID: o.UID})
+		ids = append(ids, o.ID)
+	}
+	if err := a.messageStore.RestoreMessages(entries); err != nil {
+		return err
+	}
+
+	wailsRuntime.EventsEmit(a.ctx, "messages:moved", map[string]interface{}{
+		"messageIds":   ids,
+		"destFolderId": folderID,
+	})
+	a.emitFolderCounts(folderID)
+	return nil
 }
 
 // MoveMessagesToFolderWithoutUndo implements undo.UndoContext.

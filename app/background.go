@@ -722,6 +722,13 @@ func (a *App) processNetworkEvents(ctx context.Context) {
 				wailsRuntime.EventsEmit(a.ctx, "network:online", nil)
 				// Bus event for Go-side subscribers (e.g., calendar Syncer).
 				_ = a.coreEventBus().Publish("system:network-online", nil)
+				// Mutations queued while offline have been failing and backing
+				// off; reconnecting is the moment they can finally land, so
+				// drain before syncing rather than letting the sync observe a
+				// server that hasn't heard about them yet.
+				if a.opDrainer != nil {
+					a.opDrainer.Wake()
+				}
 				a.syncAfterWake()
 			} else {
 				log.Info().Msg("Network connectivity lost — stopping IDLE and clearing pool")

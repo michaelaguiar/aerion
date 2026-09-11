@@ -2093,6 +2093,49 @@ func (s *Store) MoveMessages(ids []string, newFolderID string) error {
 	return nil
 }
 
+// FolderUID places a message back in a folder at a specific UID.
+type FolderUID struct {
+	ID       string
+	FolderID string
+	UID      uint32
+}
+
+// RestoreMessages reverses the local half of MoveMessages, putting each message
+// back in its original folder with the UID the server still knows it by.
+//
+// Used when a move is cancelled before its queued server op runs: nothing ever
+// reached IMAP, so the local rows simply go back the way they were. Restoring
+// the real UID (rather than leaving the -rowid placeholder) is what makes the
+// cancelled move invisible to the next sync.
+func (s *Store) RestoreMessages(entries []FolderUID) error {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin restore: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	stmt, err := tx.Prepare(`UPDATE messages SET folder_id = ?, uid = ? WHERE id = ?`)
+	if err != nil {
+		return fmt.Errorf("failed to prepare restore: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, e := range entries {
+		if _, err := stmt.Exec(e.FolderID, e.UID, e.ID); err != nil {
+			return fmt.Errorf("failed to restore message %s: %w", e.ID, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit restore: %w", err)
+	}
+	return nil
+}
+
 // DeleteTempUIDs removes messages with temporary negative UIDs in a folder.
 // These are left over after MoveMessages assigns -rowid as a placeholder UID.
 func (s *Store) DeleteTempUIDs(folderID string) error {

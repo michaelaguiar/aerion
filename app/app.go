@@ -12,6 +12,8 @@ import (
 	goSync "sync"
 	"time"
 
+	extcalendarbe "github.com/hkdb/aerion/extensions/calendar/backend"
+	extcontactsbe "github.com/hkdb/aerion/extensions/contacts/backend"
 	"github.com/hkdb/aerion/internal/account"
 	"github.com/hkdb/aerion/internal/appstate"
 	"github.com/hkdb/aerion/internal/carddav"
@@ -21,8 +23,6 @@ import (
 	"github.com/hkdb/aerion/internal/credentials"
 	"github.com/hkdb/aerion/internal/database"
 	"github.com/hkdb/aerion/internal/draft"
-	extcalendarbe "github.com/hkdb/aerion/extensions/calendar/backend"
-	extcontactsbe "github.com/hkdb/aerion/extensions/contacts/backend"
 	extauth "github.com/hkdb/aerion/internal/extensions/auth"
 	extcompose "github.com/hkdb/aerion/internal/extensions/compose"
 	extmail "github.com/hkdb/aerion/internal/extensions/mail"
@@ -35,9 +35,10 @@ import (
 	"github.com/hkdb/aerion/internal/message"
 	"github.com/hkdb/aerion/internal/notification"
 	"github.com/hkdb/aerion/internal/oauth2"
+	"github.com/hkdb/aerion/internal/ops"
+	"github.com/hkdb/aerion/internal/pgp"
 	"github.com/hkdb/aerion/internal/platform"
 	"github.com/hkdb/aerion/internal/settings"
-	"github.com/hkdb/aerion/internal/pgp"
 	"github.com/hkdb/aerion/internal/smime"
 	"github.com/hkdb/aerion/internal/sync"
 	"github.com/hkdb/aerion/internal/undo"
@@ -238,14 +239,14 @@ type App struct {
 	// into App via its Bridge struct (declared at the top of this struct
 	// definition); the *Extension field below is the lightweight lifecycle
 	// handle the host's knownExtensions Register loop iterates.
-	authBroker       *extauth.Broker      // coreapi.Auth impl for extensions
-	mailAPI          *extmail.API         // coreapi.Mail impl wrapping core stores
-	composerAPI      *extcompose.API      // coreapi.Composer impl wrapping OpenComposerWindow
-	uiRegistry       *extui.Registry      // coreapi.UI impl: rail tabs, account-setup hooks, ...
-	contactsExt      *extcontactsbe.Extension // Contacts lifecycle handle (manifest + Register only)
-	calendarExt      *extcalendarbe.Extension // Calendar lifecycle handle (manifest + Register only)
-	knownExtensions  []coreapi.Extension      // all first-party extensions, iterated by ListExtensions
-	extensionUnregs  []coreapi.Unregister     // teardown funcs returned from each Extension.Register
+	authBroker      *extauth.Broker          // coreapi.Auth impl for extensions
+	mailAPI         *extmail.API             // coreapi.Mail impl wrapping core stores
+	composerAPI     *extcompose.API          // coreapi.Composer impl wrapping OpenComposerWindow
+	uiRegistry      *extui.Registry          // coreapi.UI impl: rail tabs, account-setup hooks, ...
+	contactsExt     *extcontactsbe.Extension // Contacts lifecycle handle (manifest + Register only)
+	calendarExt     *extcalendarbe.Extension // Calendar lifecycle handle (manifest + Register only)
+	knownExtensions []coreapi.Extension      // all first-party extensions, iterated by ListExtensions
+	extensionUnregs []coreapi.Unregister     // teardown funcs returned from each Extension.Register
 
 	// coreapi.EventBus implementation, lazily constructed on first
 	// Core.Events() call (via eventBusInitOnce). Extensions consume via
@@ -277,6 +278,11 @@ type App struct {
 
 	// Undo system
 	undoStack *undo.Stack
+
+	// Durable outbox for server-side mutations, and the worker that drains it.
+	// Actions apply locally and enqueue here; see internal/ops.
+	opStore   *ops.Store
+	opDrainer *ops.Drainer
 
 	// IPC for multi-window support (composer windows)
 	ipcServer   ipc.Server
@@ -324,7 +330,7 @@ type App struct {
 
 	// Draft IMAP sync goroutine tracking — cancel in-flight syncDraftToIMAP
 	draftSyncContexts map[string]context.CancelFunc // keyed by draft ID
-	draftSyncDone     map[string]chan struct{}       // closed when goroutine exits
+	draftSyncDone     map[string]chan struct{}      // closed when goroutine exits
 
 	// Sleep/wake detection for auto-sync on wake
 	sleepWakeMonitor platform.SleepWakeMonitor
@@ -513,6 +519,12 @@ func (a *App) Preflight() error {
 // previous 30s predated stable message identity, when an undo could only
 // succeed inside a narrow window after the destination sync.
 const undoRetention = 5 * time.Minute
+
+// opFlushTimeout bounds how long shutdown waits for queued mailbox operations
+// to reach the server. Anything still queued past this survives in the
+// database and runs at next startup, so the cost of giving up is delay, not
+// data loss.
+const opFlushTimeout = 10 * time.Second
 
 // shuttingDown tracks if shutdown has been initiated to prevent multiple triggers
 var shuttingDown bool
@@ -716,8 +728,15 @@ func (a *App) Startup(ctx context.Context) {
 	// Start CardDAV background sync scheduler
 	a.carddavScheduler.Start(ctx)
 
-	// Initialize undo stack (max 50 commands, 30 second timeout)
+	// Initialize undo stack (max 50 commands, see undoRetention)
 	a.undoStack = undo.NewStack(50, undoRetention)
+
+	// Durable mutation outbox. Started before any action can be taken so a
+	// mutation is never enqueued with nothing to drain it, and so ops stranded
+	// by a previous run are released and retried at startup.
+	a.opStore = ops.NewStore(db)
+	a.opDrainer = ops.NewDrainer(a.opStore, a, logging.WithComponent("app.ops"))
+	a.opDrainer.Start(ctx)
 
 	// OAuth2 manager was constructed earlier (before the Auth Broker, which
 	// captures it). See the earlier guarded init above for the rationale.
@@ -984,6 +1003,21 @@ func (a *App) InitiateShutdown() {
 // Shutdown is called when the app is closing
 func (a *App) Shutdown(ctx context.Context) {
 	log := logging.WithComponent("app")
+
+	// Flush queued mutations before anything is torn down. A move or delete
+	// sitting in its defer window has already been applied locally and shown to
+	// the user; dropping it on exit would let the next sync resurrect the
+	// message. Bounded so a dead server can't block quitting.
+	if a.opDrainer != nil {
+		if n, err := a.opStore.PendingCount(); err == nil && n > 0 {
+			log.Info().Int("count", n).Msg("Flushing queued mailbox operations before shutdown")
+			flushCtx, cancel := context.WithTimeout(context.Background(), opFlushTimeout)
+			if err := a.opDrainer.Flush(flushCtx); err != nil {
+				log.Warn().Err(err).Msg("Queued operations remain; they will run at next startup")
+			}
+			cancel()
+		}
+	}
 
 	// Broadcast shutdown to all composer windows
 	if a.ipcServer != nil {
