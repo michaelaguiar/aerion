@@ -49,6 +49,7 @@ type Drainer struct {
 	log     zerolog.Logger
 	wake    chan struct{}
 	stopped chan struct{}
+	cancel  context.CancelFunc
 }
 
 // NewDrainer creates a drainer. Call Start to run it.
@@ -67,6 +68,8 @@ func NewDrainer(store *Store, exec Executor, log zerolog.Logger) *Drainer {
 // Ops left in running state by a previous process are released back to pending
 // first — a running row means the app died mid-execution.
 func (d *Drainer) Start(ctx context.Context) {
+	ctx, d.cancel = context.WithCancel(ctx)
+
 	if n, err := d.store.ReleaseRunning(); err != nil {
 		d.log.Warn().Err(err).Msg("Failed to release stranded ops")
 	} else if n > 0 {
@@ -142,6 +145,25 @@ func (d *Drainer) Flush(ctx context.Context) error {
 		}
 
 		d.run(ctx, op)
+	}
+}
+
+// Stop halts the drain loop and waits for any in-flight op to finish, giving
+// up when ctx expires.
+//
+// Shutdown calls this before Flush so exactly one thing is executing ops during
+// teardown. Otherwise the background loop and the flush run concurrently,
+// competing for the IMAP pool at the moment the app is trying to exit
+// promptly, and the flush can report an empty queue while the loop is still
+// mid-operation.
+func (d *Drainer) Stop(ctx context.Context) {
+	if d.cancel != nil {
+		d.cancel()
+	}
+	select {
+	case <-d.stopped:
+	case <-ctx.Done():
+		d.log.Warn().Msg("Drain loop did not stop in time; flushing anyway")
 	}
 }
 
