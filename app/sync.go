@@ -11,7 +11,6 @@ import (
 	"github.com/hkdb/aerion/internal/certificate"
 	"github.com/hkdb/aerion/internal/folder"
 	"github.com/hkdb/aerion/internal/logging"
-	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 // ============================================================================
@@ -72,7 +71,7 @@ func (a *App) SyncFolder(accountID, folderID string) error {
 	// Emit the engine's initial progress event first so the sidebar spinner
 	// appears immediately — otherwise the wait looks like a dead sync button.
 	if a.recentOwnExpunge(accountID) {
-		wailsRuntime.EventsEmit(a.ctx, "sync:progress", map[string]interface{}{
+		a.emitUI("sync:progress", map[string]interface{}{
 			"accountId": accountID,
 			"folderId":  folderID,
 			"fetched":   0,
@@ -97,7 +96,7 @@ func (a *App) SyncFolder(accountID, folderID string) error {
 		var certErr *certificate.Error
 		if errors.As(err, &certErr) {
 			log.Warn().Str("folder", folderID).Str("fingerprint", certErr.Info.Fingerprint).Msg("Untrusted certificate during sync")
-			wailsRuntime.EventsEmit(a.ctx, "certificate:untrusted", map[string]interface{}{
+			a.emitUI("certificate:untrusted", map[string]interface{}{
 				"accountId":   accountID,
 				"certificate": certErr.Info,
 			})
@@ -106,7 +105,7 @@ func (a *App) SyncFolder(accountID, folderID string) error {
 
 		// Actual error - emit error event
 		log.Error().Err(err).Str("folder", folderID).Msg("Header sync failed")
-		wailsRuntime.EventsEmit(a.ctx, "folder:syncError", map[string]interface{}{
+		a.emitUI("folder:syncError", map[string]interface{}{
 			"accountId": accountID,
 			"folderId":  folderID,
 			"error":     err.Error(),
@@ -125,7 +124,7 @@ func (a *App) SyncFolder(accountID, folderID string) error {
 			Str("folderID", folderID).
 			Int("unreadCount", folderObj.UnreadCount).
 			Msg("Emitting folders:countsChanged after sync")
-		wailsRuntime.EventsEmit(a.ctx, "folders:countsChanged", map[string]int{
+		a.emitUI("folders:countsChanged", map[string]int{
 			folderID: folderObj.UnreadCount,
 		})
 	}
@@ -147,7 +146,7 @@ func (a *App) SyncFolder(accountID, folderID string) error {
 		defer func() {
 			if r := recover(); r != nil {
 				log.Error().Interface("panic", r).Str("folder", folderID).Msg("Body fetch goroutine panicked")
-				wailsRuntime.EventsEmit(a.ctx, "folder:syncError", map[string]interface{}{
+				a.emitUI("folder:syncError", map[string]interface{}{
 					"accountId": accountID,
 					"folderId":  folderID,
 					"error":     fmt.Sprintf("body fetch panic: %v", r),
@@ -161,14 +160,14 @@ func (a *App) SyncFolder(accountID, folderID string) error {
 			if syncCtx.Err() != nil {
 				// Cancelled - not an error, still emit synced so spinner stops
 				log.Debug().Str("folder", folderID).Msg("Background body fetch cancelled")
-				wailsRuntime.EventsEmit(a.ctx, "folder:synced", map[string]interface{}{
+				a.emitUI("folder:synced", map[string]interface{}{
 					"accountId": accountID,
 					"folderId":  folderID,
 				})
 			} else {
 				// Actual error - emit error event instead of synced
 				log.Error().Err(bodyErr).Str("folder", folderID).Msg("Background body fetch failed")
-				wailsRuntime.EventsEmit(a.ctx, "folder:syncError", map[string]interface{}{
+				a.emitUI("folder:syncError", map[string]interface{}{
 					"accountId": accountID,
 					"folderId":  folderID,
 					"error":     bodyErr.Error(),
@@ -176,7 +175,7 @@ func (a *App) SyncFolder(accountID, folderID string) error {
 			}
 		} else {
 			// Success
-			wailsRuntime.EventsEmit(a.ctx, "folder:synced", map[string]interface{}{
+			a.emitUI("folder:synced", map[string]interface{}{
 				"accountId": accountID,
 				"folderId":  folderID,
 			})
@@ -342,7 +341,7 @@ func (a *App) SyncAllComplete() error {
 				}
 				inbox, inboxErr := a.folderStore.GetByType(acc.ID, folder.TypeInbox)
 				if inboxErr == nil && inbox != nil {
-					wailsRuntime.EventsEmit(a.ctx, "folder:synced", map[string]interface{}{
+					a.emitUI("folder:synced", map[string]interface{}{
 						"accountId": acc.ID,
 						"folderId":  inbox.ID,
 					})
