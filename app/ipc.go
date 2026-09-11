@@ -8,7 +8,6 @@ import (
 	"github.com/hkdb/aerion/internal/folder"
 	"github.com/hkdb/aerion/internal/ipc"
 	"github.com/hkdb/aerion/internal/logging"
-	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 // ============================================================================
@@ -109,7 +108,7 @@ func (a *App) handleComposerMessageSent(payload ipc.MessageSentPayload) {
 		Msg("Composer sent message notification")
 
 	// Emit event to frontend for toast notification and folder refresh
-	wailsRuntime.EventsEmit(a.ctx, "composer:messageSent", map[string]interface{}{
+	a.emitUI("composer:messageSent", map[string]interface{}{
 		"accountId": payload.AccountID,
 		"folderId":  payload.FolderID,
 	})
@@ -173,7 +172,7 @@ func (a *App) handleComposerDraftDeleted(payload ipc.DraftDeletedPayload) {
 	}
 
 	// Notify frontend to refresh the message list immediately
-	wailsRuntime.EventsEmit(a.ctx, "messages:updated", map[string]interface{}{
+	a.emitUI("messages:updated", map[string]interface{}{
 		"accountId": payload.AccountID,
 		"folderId":  draftsFolder.ID,
 	})
