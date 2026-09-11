@@ -506,6 +506,14 @@ func (a *App) Preflight() error {
 	return nil
 }
 
+// undoRetention is how long an action stays undoable. A move is reversible on
+// the server indefinitely, so this is a staleness guard rather than a
+// correctness one: past this point the mailbox has probably moved on and
+// silently reversing an old action would surprise more than it helps. The
+// previous 30s predated stable message identity, when an undo could only
+// succeed inside a narrow window after the destination sync.
+const undoRetention = 5 * time.Minute
+
 // shuttingDown tracks if shutdown has been initiated to prevent multiple triggers
 var shuttingDown bool
 
@@ -709,7 +717,7 @@ func (a *App) Startup(ctx context.Context) {
 	a.carddavScheduler.Start(ctx)
 
 	// Initialize undo stack (max 50 commands, 30 second timeout)
-	a.undoStack = undo.NewStack(50, 30*time.Second)
+	a.undoStack = undo.NewStack(50, undoRetention)
 
 	// OAuth2 manager was constructed earlier (before the Auth Broker, which
 	// captures it). See the earlier guarded init above for the rationale.

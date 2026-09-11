@@ -18,10 +18,13 @@ type UndoContext interface {
 	MoveLocalMessages(messageIDs []string, folderID string) error
 	// DeleteLocalMessages deletes messages from local database
 	DeleteLocalMessages(messageIDs []string) error
-	// FindLocalMessageIDs finds current local DB message IDs by RFC822 Message-ID and folder
-	FindLocalMessageIDs(accountID, folderID string, rfc822MessageIDs []string) ([]string, error)
-	// MoveMessagesToFolder moves messages using the full move pipeline (IMAP + local DB)
-	MoveMessagesToFolder(messageIDs []string, destFolderID string) error
+	// ResolveMessagesInFolder returns the local DB ids still present in folderID,
+	// preferring the supplied local ids and falling back to RFC822 Message-ID
+	// lookup for any that no longer resolve.
+	ResolveMessagesInFolder(accountID, folderID string, localIDs, rfc822MessageIDs []string) ([]string, error)
+	// MoveMessagesToFolderWithoutUndo moves messages using the full move pipeline
+	// (IMAP + local DB) without pushing a new command onto the undo stack.
+	MoveMessagesToFolderWithoutUndo(messageIDs []string, destFolderID string) error
 }
 
 // FlagChangeCommand handles read/star flag changes
@@ -126,38 +129,66 @@ type MoveCommand struct {
 	BaseCommand
 	undoCtx          UndoContext
 	accountID        string
-	rfc822MessageIDs []string // RFC822 Message-ID headers for reliable lookup
+	localMessageIDs  []string // Local DB ids — stable across the move (see Store.ReconcileMovedMessage)
+	rfc822MessageIDs []string // Fallback lookup key for rows that couldn't be reconciled
 	sourceFolderID   string
 	destFolderID     string
+	settled          func() error // Blocks until the move's IMAP + destination sync finished
 }
 
-// NewMoveCommand creates a new MoveCommand
+// NewMoveCommand creates a new MoveCommand.
+//
+// settled blocks until the originating move has finished its IMAP work and the
+// destination folder has synced, so Undo never tries to reverse a move the
+// server hasn't been told about yet. It may be nil, in which case Undo
+// proceeds immediately.
 func NewMoveCommand(
 	undoCtx UndoContext,
 	accountID string,
+	localMessageIDs []string,
 	rfc822MessageIDs []string,
 	sourceFolderID string,
 	destFolderID string,
 	description string,
+	settled func() error,
 ) *MoveCommand {
 	return &MoveCommand{
 		BaseCommand:      NewBaseCommand(description),
 		undoCtx:          undoCtx,
 		accountID:        accountID,
+		localMessageIDs:  localMessageIDs,
 		rfc822MessageIDs: rfc822MessageIDs,
 		sourceFolderID:   sourceFolderID,
 		destFolderID:     destFolderID,
+		settled:          settled,
 	}
 }
 
 // Execute performs the action (already done at creation time)
 func (c *MoveCommand) Execute() error { return nil }
 
-// Undo reverses the move by finding current messages in the destination folder
-// and moving them back using the standard move pipeline.
+// Undo reverses the move using the standard move pipeline.
+//
+// The messages are addressed by the local ids captured when the move was made.
+// Those ids survive the round trip because the destination sync rebinds the
+// parked row rather than replacing it; the Message-ID lookup is kept only as a
+// fallback for rows that couldn't be reconciled (a message with no Message-ID
+// header, or a server that never reported the copy).
 func (c *MoveCommand) Undo() error {
-	// Find current local message IDs by RFC822 Message-ID in the destination folder
-	localMsgIDs, err := c.undoCtx.FindLocalMessageIDs(c.accountID, c.destFolderID, c.rfc822MessageIDs)
+	// Reversing a move requires a real server UID, which only exists once the
+	// IMAP COPY has landed and the destination folder has synced. Undoing
+	// before that point would move the local row back while leaving the
+	// message in the destination folder on the server — the next sync would
+	// silently undo the undo.
+	if c.settled != nil {
+		if err := c.settled(); err != nil {
+			return fmt.Errorf("move still in flight: %w", err)
+		}
+	}
+
+	localMsgIDs, err := c.undoCtx.ResolveMessagesInFolder(
+		c.accountID, c.destFolderID, c.localMessageIDs, c.rfc822MessageIDs,
+	)
 	if err != nil {
 		return fmt.Errorf("failed to find messages: %w", err)
 	}
@@ -165,6 +196,7 @@ func (c *MoveCommand) Undo() error {
 		return fmt.Errorf("messages not found in destination folder")
 	}
 
-	// Reuse the full move pipeline (IMAP + local DB + events)
-	return c.undoCtx.MoveMessagesToFolder(localMsgIDs, c.sourceFolderID)
+	// Reuse the full move pipeline (IMAP + local DB + events). Undoing must not
+	// itself become an undoable action, or a second Ctrl+Z would redo the move.
+	return c.undoCtx.MoveMessagesToFolderWithoutUndo(localMsgIDs, c.sourceFolderID)
 }

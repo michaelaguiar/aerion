@@ -287,6 +287,20 @@ func (a *App) syncFlagsToIMAP(messages []*message.Message, folderID, flagType st
 
 // MoveToFolder moves messages to a specified folder
 func (a *App) MoveToFolder(messageIDs []string, destFolderID string) error {
+	return a.moveToFolder(messageIDs, destFolderID, true)
+}
+
+// moveSettleTimeout bounds how long an undo waits for the originating move's
+// IMAP work and destination sync to finish. Reversing a move needs the real
+// server UID, which only exists after that round trip. Generous enough to
+// cover a slow server, short enough that a wedged sync surfaces as an error
+// rather than a hung UI.
+const moveSettleTimeout = 20 * time.Second
+
+// moveToFolder is the MoveToFolder implementation. recordUndo is false when the
+// move is itself the reversal of an earlier one, so a second Ctrl+Z undoes the
+// action before it rather than redoing the move.
+func (a *App) moveToFolder(messageIDs []string, destFolderID string, recordUndo bool) error {
 	log := logging.WithComponent("app")
 
 	if len(messageIDs) == 0 {
@@ -410,8 +424,15 @@ func (a *App) MoveToFolder(messageIDs []string, destFolderID string) error {
 	// so that back-to-back moves to the same folder are serialized — the second call
 	// cancels the first and starts fresh, preventing the first sync from deleting
 	// locally-moved messages whose IMAP COPY hasn't completed yet.
+	// Closed once the IMAP move and the destination sync have finished, so an
+	// undo can wait for the message to have a real server UID before trying to
+	// move it back. Closed on every exit path, including IMAP failure — a
+	// failed move must not wedge undo forever.
+	moveSettled := make(chan struct{})
+
 	go func() {
 		defer recoverPanic("app.actions", "move messages on IMAP")
+		defer close(moveSettled)
 		for sourceFolderID, msgs := range byFolder {
 			if err := a.moveMessagesToIMAP(msgs, sourceFolderID, destFolder); err != nil {
 				log.Error().Err(err).
@@ -431,37 +452,68 @@ func (a *App) MoveToFolder(messageIDs []string, destFolderID string) error {
 			delete(a.syncLastRequest, syncKey)
 			a.syncMu.Unlock()
 
-			if err := a.SyncFolder(accountID, destFolderID); err != nil && err != context.Canceled {
-				log.Warn().Err(err).Str("destFolderID", destFolderID).Msg("Failed to sync destination folder after move")
+			syncErr := a.SyncFolder(accountID, destFolderID)
+			if syncErr != nil && syncErr != context.Canceled {
+				log.Warn().Err(syncErr).Str("destFolderID", destFolderID).Msg("Failed to sync destination folder after move")
 			}
 
-			// Clean up temporary negative-UID rows left by MoveMessages.
-			// The sync above fetched the real messages with correct UIDs.
-			if err := a.messageStore.DeleteTempUIDs(destFolderID); err != nil {
-				log.Warn().Err(err).Str("destFolderID", destFolderID).Msg("Failed to clean up temp UIDs after move")
+			// Clean up whatever is still parked at a negative UID. The sync
+			// above rebinds every message it can match by Message-ID, so this
+			// now only reaps rows that couldn't be reconciled (no Message-ID
+			// header, or the server never reported the copy).
+			//
+			// Skipped when the sync failed: the parked row is the only local
+			// copy of that message, along with its body and attachments.
+			// Leaving it in place costs a stale row until the next successful
+			// sync reconciles it; deleting it throws the message away.
+			if syncErr == nil {
+				if err := a.messageStore.DeleteTempUIDs(destFolderID); err != nil {
+					log.Warn().Err(err).Str("destFolderID", destFolderID).Msg("Failed to clean up temp UIDs after move")
+				}
 			}
 		}
 	}()
 
+	if !recordUndo {
+		return nil
+	}
+
+	// Wait for the move to reach the server before reversing it. Bounded so a
+	// stalled sync fails the undo with a message instead of hanging the UI.
+	settled := func() error {
+		select {
+		case <-moveSettled:
+			return nil
+		case <-time.After(moveSettleTimeout):
+			return fmt.Errorf("timed out after %s waiting for the move to reach the server", moveSettleTimeout)
+		}
+	}
+
 	// Create undo command for each source folder
 	for sourceFolderID, msgs := range byFolder {
+		localIDs := make([]string, 0, len(msgs))
 		rfc822IDs := make([]string, 0, len(msgs))
 		for _, m := range msgs {
+			// Local ids stay valid across the move: the destination sync
+			// rebinds these rows rather than replacing them.
+			localIDs = append(localIDs, m.ID)
 			if m.MessageID != "" {
 				rfc822IDs = append(rfc822IDs, m.MessageID)
 			}
 		}
-		if len(rfc822IDs) == 0 {
+		if len(localIDs) == 0 {
 			continue
 		}
 
 		cmd := undo.NewMoveCommand(
 			a,
 			msgs[0].AccountID,
+			localIDs,
 			rfc822IDs,
 			sourceFolderID,
 			destFolderID,
 			fmt.Sprintf("Move to %s", destFolder.Name),
+			settled,
 		)
 		a.undoStack.Push(cmd)
 	}
