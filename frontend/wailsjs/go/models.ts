@@ -2235,6 +2235,118 @@ export namespace message {
 
 }
 
+export namespace ops {
+	
+	export class MessageRef {
+	    id: string;
+	    uid: number;
+	    messageId?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new MessageRef(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.uid = source["uid"];
+	        this.messageId = source["messageId"];
+	    }
+	}
+	export class Payload {
+	    messages?: MessageRef[];
+	    sourceFolderId?: string;
+	    destFolderId?: string;
+	    flagType?: string;
+	    flagValue?: boolean;
+	    rawPath?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new Payload(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.messages = this.convertValues(source["messages"], MessageRef);
+	        this.sourceFolderId = source["sourceFolderId"];
+	        this.destFolderId = source["destFolderId"];
+	        this.flagType = source["flagType"];
+	        this.flagValue = source["flagValue"];
+	        this.rawPath = source["rawPath"];
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class Op {
+	    ID: string;
+	    AccountID: string;
+	    Type: string;
+	    Payload: Payload;
+	    State: string;
+	    // Go type: time
+	    NotBefore: any;
+	    Attempt: number;
+	    // Go type: time
+	    LastAttempt: any;
+	    LastError: string;
+	    // Go type: time
+	    CreatedAt: any;
+	
+	    static createFrom(source: any = {}) {
+	        return new Op(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.ID = source["ID"];
+	        this.AccountID = source["AccountID"];
+	        this.Type = source["Type"];
+	        this.Payload = this.convertValues(source["Payload"], Payload);
+	        this.State = source["State"];
+	        this.NotBefore = this.convertValues(source["NotBefore"], null);
+	        this.Attempt = source["Attempt"];
+	        this.LastAttempt = this.convertValues(source["LastAttempt"], null);
+	        this.LastError = source["LastError"];
+	        this.CreatedAt = this.convertValues(source["CreatedAt"], null);
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+
+}
+
 export namespace pgp {
 	
 	export class Key {
@@ -2766,6 +2878,25 @@ export namespace sync {
 		    }
 		    return a;
 		}
+	}
+
+}
+
+export namespace undo {
+	
+	export class MessageUID {
+	    id: string;
+	    uid: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new MessageUID(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.uid = source["uid"];
+	    }
 	}
 
 }
