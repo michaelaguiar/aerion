@@ -2,7 +2,6 @@ package app
 
 import (
 	extcontactsbe "github.com/hkdb/aerion/extensions/contacts/backend"
-	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 // initContactsExtension wires the Contacts extension's Bridge into App
@@ -26,7 +25,7 @@ func (a *App) initContactsExtension() {
 
 	// Single emitter for all contacts:* frontend events (conflict, changed).
 	emit := func(eventName string, payload any) {
-		wailsRuntime.EventsEmit(a.ctx, eventName, payload)
+		a.emitUI(eventName, payload)
 	}
 
 	a.ContactsBridge = extcontactsbe.NewContactsBridge(extcontactsbe.ContactsBridgeDeps{

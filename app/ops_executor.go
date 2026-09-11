@@ -9,7 +9,6 @@ import (
 	"github.com/hkdb/aerion/internal/message"
 	"github.com/hkdb/aerion/internal/ops"
 	"github.com/hkdb/aerion/internal/undo"
-	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 // opDeferWindow is how long a queued mutation waits before the drainer sends
@@ -114,7 +113,7 @@ func (a *App) emitFolderCounts(folderID string) {
 		log.Warn().Err(err).Str("folderID", folderID).Msg("Failed to update folder counts")
 		return
 	}
-	wailsRuntime.EventsEmit(a.ctx, "folders:countsChanged", map[string]int{folderID: unread})
+	a.emitUI("folders:countsChanged", map[string]int{folderID: unread})
 }
 
 // opMessages rebuilds the message values an IMAP helper needs from an op
@@ -167,6 +166,15 @@ func (a *App) execMoveOp(ctx context.Context, op *ops.Op) error {
 
 	if err := a.moveMessagesToIMAP(msgs, op.Payload.SourceFolderID, destFolder); err != nil {
 		return fmt.Errorf("move to %s failed: %w", destFolder.Path, err)
+	}
+
+	// During the shutdown flush there is no one left to show the result to, and
+	// the sync is by far the most expensive part of this op — it would eat the
+	// bounded flush budget that the IMAP move above actually needs. The moved
+	// messages keep their parked UIDs and are reconciled by the first sync
+	// after restart, exactly as they would be if the app had been killed here.
+	if a.uiTornDown.Load() {
+		return nil
 	}
 
 	// Sync the destination so the moved messages get their real UIDs. Clear the

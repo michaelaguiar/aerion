@@ -49,7 +49,7 @@ func (a *App) StartOAuthFlow(provider string) error {
 	// Start the OAuth flow
 	authURL, err := a.oauth2Manager.StartAuthFlow(a.ctx, provider)
 	if err != nil {
-		wailsRuntime.EventsEmit(a.ctx, "oauth:error", map[string]interface{}{
+		a.emitUI("oauth:error", map[string]interface{}{
 			"provider": provider,
 			"error":    err.Error(),
 		})
@@ -58,7 +58,7 @@ func (a *App) StartOAuthFlow(provider string) error {
 
 	// Emit started event with the auth URL so the frontend can show a
 	// "Copy link" fallback affordance for users whose browser fails to open.
-	wailsRuntime.EventsEmit(a.ctx, "oauth:started", map[string]interface{}{
+	a.emitUI("oauth:started", map[string]interface{}{
 		"provider": provider,
 		"authURL":  authURL,
 	})
@@ -78,7 +78,7 @@ func (a *App) StartOAuthFlow(provider string) error {
 		tokens, email, err := a.oauth2Manager.WaitForCallback(a.ctx)
 		if err != nil {
 			log.Error().Err(err).Str("provider", provider).Msg("OAuth callback failed")
-			wailsRuntime.EventsEmit(a.ctx, "oauth:error", map[string]interface{}{
+			a.emitUI("oauth:error", map[string]interface{}{
 				"provider": provider,
 				"error":    err.Error(),
 			})
@@ -95,7 +95,7 @@ func (a *App) StartOAuthFlow(provider string) error {
 			Msg("OAuth flow completed successfully")
 
 		// Emit success event with tokens info (frontend will handle account creation)
-		wailsRuntime.EventsEmit(a.ctx, "oauth:success", map[string]interface{}{
+		a.emitUI("oauth:success", map[string]interface{}{
 			"provider":  provider,
 			"email":     email,
 			"expiresIn": tokens.ExpiresIn,
@@ -286,14 +286,14 @@ func (a *App) StartCustomOAuthFlow(authURL, tokenURL, userinfoURL string, scopes
 	authRedirectURL, err := a.oauth2Manager.StartAuthFlowWithProvider(a.ctx, provider)
 	if err != nil {
 		a.pendingCustomProvider = nil
-		wailsRuntime.EventsEmit(a.ctx, "oauth:error", map[string]interface{}{
+		a.emitUI("oauth:error", map[string]interface{}{
 			"provider": customOAuthProviderName,
 			"error":    err.Error(),
 		})
 		return fmt.Errorf("failed to start custom OAuth flow: %w", err)
 	}
 
-	wailsRuntime.EventsEmit(a.ctx, "oauth:started", map[string]interface{}{
+	a.emitUI("oauth:started", map[string]interface{}{
 		"provider": customOAuthProviderName,
 		"authURL":  authRedirectURL,
 	})
@@ -313,7 +313,7 @@ func (a *App) StartCustomOAuthFlow(authURL, tokenURL, userinfoURL string, scopes
 		tokens, email, err := a.oauth2Manager.WaitForCallback(a.ctx)
 		if err != nil {
 			log.Error().Err(err).Str("provider", customOAuthProviderName).Msg("Custom OAuth callback failed")
-			wailsRuntime.EventsEmit(a.ctx, "oauth:error", map[string]interface{}{
+			a.emitUI("oauth:error", map[string]interface{}{
 				"provider": customOAuthProviderName,
 				"error":    err.Error(),
 			})
@@ -328,7 +328,7 @@ func (a *App) StartCustomOAuthFlow(authURL, tokenURL, userinfoURL string, scopes
 			Str("email", email).
 			Msg("Custom OAuth flow completed successfully")
 
-		wailsRuntime.EventsEmit(a.ctx, "oauth:success", map[string]interface{}{
+		a.emitUI("oauth:success", map[string]interface{}{
 			"provider":  customOAuthProviderName,
 			"email":     email,
 			"expiresIn": tokens.ExpiresIn,
@@ -524,7 +524,7 @@ func (a *App) CancelOAuthFlow() {
 	a.pendingOAuthTokens = nil
 	a.pendingOAuthEmail = ""
 
-	wailsRuntime.EventsEmit(a.ctx, "oauth:cancelled", nil)
+	a.emitUI("oauth:cancelled", nil)
 }
 
 // GetOAuthStatus returns the OAuth status for an account.

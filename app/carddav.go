@@ -478,7 +478,7 @@ func (a *App) StartContactsOnlyOAuthFlow(provider string) error {
 	// Start the OAuth flow using the contacts-only provider
 	authURL, err := a.oauth2Manager.StartAuthFlowWithProvider(a.ctx, &providerConfig)
 	if err != nil {
-		wailsRuntime.EventsEmit(a.ctx, "contact-source-oauth:error", map[string]interface{}{
+		a.emitUI("contact-source-oauth:error", map[string]interface{}{
 			"provider": provider,
 			"error":    err.Error(),
 		})
@@ -487,7 +487,7 @@ func (a *App) StartContactsOnlyOAuthFlow(provider string) error {
 
 	// Emit started event with the auth URL so the frontend can show a
 	// "Copy link" fallback affordance for users whose browser fails to open.
-	wailsRuntime.EventsEmit(a.ctx, "contact-source-oauth:started", map[string]interface{}{
+	a.emitUI("contact-source-oauth:started", map[string]interface{}{
 		"provider": provider,
 		"authURL":  authURL,
 	})
@@ -505,7 +505,7 @@ func (a *App) StartContactsOnlyOAuthFlow(provider string) error {
 		tokens, email, err := a.oauth2Manager.WaitForCallback(a.ctx)
 		if err != nil {
 			log.Error().Err(err).Str("provider", provider).Msg("Contact source OAuth callback failed")
-			wailsRuntime.EventsEmit(a.ctx, "contact-source-oauth:error", map[string]interface{}{
+			a.emitUI("contact-source-oauth:error", map[string]interface{}{
 				"provider": provider,
 				"error":    err.Error(),
 			})
@@ -523,7 +523,7 @@ func (a *App) StartContactsOnlyOAuthFlow(provider string) error {
 			Msg("Contact source OAuth flow completed successfully")
 
 		// Emit success event
-		wailsRuntime.EventsEmit(a.ctx, "contact-source-oauth:success", map[string]interface{}{
+		a.emitUI("contact-source-oauth:success", map[string]interface{}{
 			"provider":  provider,
 			"email":     email,
 			"expiresIn": tokens.ExpiresIn,
@@ -632,7 +632,7 @@ func (a *App) CancelContactSourceOAuthFlow() {
 	a.pendingContactSourceOAuthEmail = ""
 	a.pendingContactSourceOAuthProvider = ""
 
-	wailsRuntime.EventsEmit(a.ctx, "contact-source-oauth:cancelled", nil)
+	a.emitUI("contact-source-oauth:cancelled", nil)
 }
 
 // addressbookDisplayName resolves the stored name for an addressbook path:
