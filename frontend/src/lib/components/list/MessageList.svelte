@@ -1347,6 +1347,55 @@
     showEmptyTrashConfirm = false
   }
 
+  // Drops the deleted messages out of the list immediately, without waiting for
+  // the backend. Returns the previous list (to put back if the call fails) and
+  // the index of the first row that went, which is where selection lands.
+  //
+  // A conversation only disappears when every one of its messages is going; a
+  // partial delete leaves the row in place with the remaining messages, which
+  // is what the reload would have produced anyway.
+  function removeMessagesLocally(messageIds: string[]) {
+    const going = new Set(messageIds)
+    const snapshot = conversations
+    let firstIndex = -1
+
+    const next: message.Conversation[] = []
+    conversations.forEach((conv, index) => {
+      const ids = conv.messageIds || []
+      const remaining = ids.filter((id) => !going.has(id))
+      if (remaining.length === ids.length) {
+        next.push(conv)
+        return
+      }
+      if (firstIndex < 0) firstIndex = index
+      if (remaining.length === 0) return
+      next.push({ ...conv, messageIds: remaining, messageCount: remaining.length } as message.Conversation)
+    })
+
+    conversations = next
+    return { snapshot, firstIndex }
+  }
+
+  // After an optimistic removal the row that slid into the vacated index IS the
+  // next message, so selection needs no reload to resolve.
+  function selectAfterRemoval(index: number) {
+    if (index < 0) return
+    const isNarrow = getLayoutMode() === 'narrow'
+    if (isNarrow) {
+      hideViewer()
+    }
+    if (conversations.length === 0) return
+
+    const newIndex = Math.min(index, conversations.length - 1)
+    const conv = conversations[newIndex]
+    if (!conv) return
+    if (isNarrow) {
+      selectedThreadId = conv.threadId
+    } else {
+      selectConversation(conv.threadId, newIndex)
+    }
+  }
+
   // Shared delete handler — same flow as context menu "Delete" action
   // Set permanent=true to force permanent delete (e.g. Shift+Delete)
   export function requestDelete(messageIds: string[], permanent: boolean = false) {
@@ -1355,16 +1404,38 @@
       showDeleteConfirm = true
       return
     }
+
+    // Remove the rows now rather than after a backend round trip plus a full
+    // list reload. This isn't a guess about what the backend will do: Trash()
+    // commits the local move before it returns, and the server half is a
+    // durable queued op that is retried until it lands or is rolled back. The
+    // only thing being skipped is the latency of hearing about it.
+    const scrollTop = listContainerRef?.scrollTop ?? 0
+    const { snapshot, firstIndex } = removeMessagesLocally(messageIds)
+    selectAfterRemoval(firstIndex)
+    clearChecked()
+
     Trash(messageIds)
       .then((movedToTrash) => {
         const toastMsg = movedToTrash ? $_('toast.movedToTrash') : $_('toast.deletedFromFolder')
         const actions = movedToTrash ? [{ label: $_('common.undo'), onClick: handleUndo }] : []
         toasts.success(toastMsg, actions)
-        handleActionComplete(true)
-        clearChecked()
+
+        // Reconcile against the database. The optimistic list is a prediction;
+        // this is what makes it a prediction rather than a replacement. Passing
+        // false skips the auto-select, which already happened — re-running it
+        // here would move the selection a second time.
+        handleActionComplete(false)
       })
       .catch((err) => {
+        // Nothing was committed, so put the rows back exactly as they were.
         console.error('Delete failed:', err)
+        conversations = snapshot
+        if (listContainerRef) {
+          requestAnimationFrame(() => {
+            listContainerRef!.scrollTop = scrollTop
+          })
+        }
         toasts.error($_('toast.failedToDelete'))
       })
   }
