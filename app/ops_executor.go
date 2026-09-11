@@ -206,7 +206,7 @@ func (a *App) compensateMove(op *ops.Op, cause error) {
 		Msg("Move abandoned; local rows rolled back to source folder")
 
 	if restored > 0 {
-		wailsRuntime.EventsEmit(a.ctx, "messages:moved", map[string]interface{}{
+		a.emitUI("messages:moved", map[string]interface{}{
 			"messageIds":   op.Payload.MessageIDs(),
 			"destFolderId": op.Payload.SourceFolderID,
 		})
@@ -227,7 +227,7 @@ func (a *App) notifyOpFailed(op *ops.Op, cause error, restored int) {
 		}
 	}
 
-	wailsRuntime.EventsEmit(a.ctx, "ops:failed", map[string]interface{}{
+	a.emitUI("ops:failed", map[string]interface{}{
 		"op":           string(op.Type),
 		"messageCount": len(op.Payload.Messages),
 		"folderName":   folderName,
