@@ -138,8 +138,10 @@ func (d *Drainer) drainReady(ctx context.Context) {
 // Flush executes everything currently queued, ignoring defer windows, and
 // returns when the queue is empty or ctx expires.
 //
-// Called during shutdown: a pending delete that never reached the server would
-// otherwise be resurrected by the next sync.
+// Not used on the shutdown path — quitting must not wait on the network, and
+// the queue is durable, so unfinished work runs at next launch. Kept for
+// callers that need the queue drained synchronously (and for tests to assert
+// deferred ops are reachable).
 func (d *Drainer) Flush(ctx context.Context) error {
 	for {
 		if err := ctx.Err(); err != nil {
@@ -163,11 +165,9 @@ func (d *Drainer) Flush(ctx context.Context) error {
 // Stop halts the drain loop and waits for any in-flight op to finish, giving
 // up when ctx expires.
 //
-// Shutdown calls this before Flush so exactly one thing is executing ops during
-// teardown. Otherwise the background loop and the flush run concurrently,
-// competing for the IMAP pool at the moment the app is trying to exit
-// promptly, and the flush can report an empty queue while the loop is still
-// mid-operation.
+// Shutdown calls this so the process is not torn down underneath an operation
+// that is mid-flight against the server. Anything unfinished stays queued and
+// runs at next launch.
 func (d *Drainer) Stop(ctx context.Context) {
 	if d.cancel != nil {
 		d.cancel()
