@@ -5,7 +5,8 @@ import (
 	"fmt"
 
 	"github.com/hkdb/aerion/internal/imap"
-	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
+	"github.com/hkdb/aerion/internal/message"
+	"github.com/hkdb/aerion/internal/undo"
 )
 
 // ============================================================================
@@ -25,7 +26,7 @@ func (a *App) Undo() (string, error) {
 	}
 
 	// Emit event to refresh UI
-	wailsRuntime.EventsEmit(a.ctx, "undo:completed", cmd.Description())
+	a.emitUI("undo:completed", cmd.Description())
 
 	return cmd.Description(), nil
 }
@@ -70,13 +71,13 @@ func (a *App) UpdateLocalFlags(messageIDs []string, isRead, isStarred *bool) err
 	// covers a hypothetical future undo that combines both without
 	// changing this call site.
 	if isRead != nil {
-		wailsRuntime.EventsEmit(a.ctx, "messages:readChanged", map[string]interface{}{
+		a.emitUI("messages:readChanged", map[string]interface{}{
 			"messageIds": messageIDs,
 			"isRead":     *isRead,
 		})
 	}
 	if isStarred != nil {
-		wailsRuntime.EventsEmit(a.ctx, "messages:starredChanged", map[string]interface{}{
+		a.emitUI("messages:starredChanged", map[string]interface{}{
 			"messageIds": messageIDs,
 			"isStarred":  *isStarred,
 		})
@@ -105,7 +106,7 @@ func (a *App) MoveLocalMessages(messageIDs []string, folderID string) error {
 	}
 
 	// Emit messages:moved event
-	wailsRuntime.EventsEmit(a.ctx, "messages:moved", map[string]interface{}{
+	a.emitUI("messages:moved", map[string]interface{}{
 		"messageIds":   messageIDs,
 		"destFolderId": folderID,
 	})
@@ -140,7 +141,7 @@ func (a *App) MoveLocalMessages(messageIDs []string, folderID string) error {
 		}
 
 		if len(folderCounts) > 0 {
-			wailsRuntime.EventsEmit(a.ctx, "folders:countsChanged", folderCounts)
+			a.emitUI("folders:countsChanged", folderCounts)
 		}
 	}()
 
@@ -151,7 +152,7 @@ func (a *App) MoveLocalMessages(messageIDs []string, folderID string) error {
 func (a *App) DeleteLocalMessages(messageIDs []string) error {
 	err := a.messageStore.DeleteBatch(messageIDs)
 	if err == nil {
-		wailsRuntime.EventsEmit(a.ctx, "messages:deleted", messageIDs)
+		a.emitUI("messages:deleted", messageIDs)
 	}
 	return err
 }
@@ -188,6 +189,35 @@ func (a *App) ResolveMessagesInFolder(accountID, folderID string, localIDs, rfc8
 		}
 	}
 	return resolved, nil
+}
+
+// CancelPendingOp implements undo.UndoContext.
+func (a *App) CancelPendingOp(opID string) (bool, error) {
+	return a.cancelOp(opID)
+}
+
+// RestoreMessages implements undo.UndoContext.
+//
+// Only reached when the move's server op was cancelled before it ran, so the
+// messages still carry these UIDs on the server and putting them back is a
+// purely local edit.
+func (a *App) RestoreMessages(originals []undo.MessageUID, folderID string) error {
+	entries := make([]message.FolderUID, 0, len(originals))
+	ids := make([]string, 0, len(originals))
+	for _, o := range originals {
+		entries = append(entries, message.FolderUID{ID: o.ID, FolderID: folderID, UID: o.UID})
+		ids = append(ids, o.ID)
+	}
+	if err := a.messageStore.RestoreMessages(entries); err != nil {
+		return err
+	}
+
+	a.emitUI("messages:moved", map[string]interface{}{
+		"messageIds":   ids,
+		"destFolderId": folderID,
+	})
+	a.emitFolderCounts(folderID)
+	return nil
 }
 
 // MoveMessagesToFolderWithoutUndo implements undo.UndoContext.

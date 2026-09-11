@@ -16,16 +16,16 @@ import (
 	"github.com/hkdb/aerion/internal/contact"
 	"github.com/hkdb/aerion/internal/credentials"
 	"github.com/hkdb/aerion/internal/draft"
-	"github.com/hkdb/aerion/internal/folder"
 	"github.com/hkdb/aerion/internal/email"
+	"github.com/hkdb/aerion/internal/folder"
 	"github.com/hkdb/aerion/internal/imap"
 	"github.com/hkdb/aerion/internal/logging"
 	"github.com/hkdb/aerion/internal/message"
-	"github.com/rs/zerolog"
 	"github.com/hkdb/aerion/internal/oauth2"
 	"github.com/hkdb/aerion/internal/pgp"
 	"github.com/hkdb/aerion/internal/smime"
 	"github.com/hkdb/aerion/internal/smtp"
+	"github.com/rs/zerolog"
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
@@ -584,7 +584,7 @@ func (a *App) handleExternalMailto(rawURL string) {
 
 	// Inline mode: show window and emit event for frontend
 	a.ShowWindow()
-	wailsRuntime.EventsEmit(a.ctx, "mailto:external", mailtoData)
+	a.emitUI("mailto:external", mailtoData)
 }
 
 // syncSentFolder syncs the Sent folder for an account after sending a message
@@ -616,13 +616,13 @@ func (a *App) syncSentFolder(accountID string) error {
 	}
 
 	// Emit synced event
-	wailsRuntime.EventsEmit(a.ctx, "folder:synced", map[string]interface{}{
+	a.emitUI("folder:synced", map[string]interface{}{
 		"accountId": accountID,
 		"folderId":  sentFolder.ID,
 	})
 
 	// Notify conversation viewer that sent folder synced (for cross-folder thread refresh)
-	wailsRuntime.EventsEmit(a.ctx, "sent:synced", map[string]interface{}{
+	a.emitUI("sent:synced", map[string]interface{}{
 		"accountId": accountID,
 	})
 
@@ -1099,7 +1099,7 @@ func quoteText(s string) string {
 func providerAutoSavesSentMail(host string) bool {
 	host = strings.ToLower(host)
 	autoSaveProviders := []string{
-		"imap.gmail.com",       // Gmail
+		"imap.gmail.com",        // Gmail
 		"outlook.office365.com", // Microsoft 365
 		"imap-mail.outlook.com", // Outlook.com
 	}
@@ -1212,4 +1212,3 @@ func detectContentType(filename string) string {
 		return "application/octet-stream"
 	}
 }
-

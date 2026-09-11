@@ -5,7 +5,6 @@ import (
 
 	"github.com/hkdb/aerion/internal/logging"
 	"github.com/hkdb/aerion/internal/platform"
-	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 // initThemeMonitor initializes the system theme monitor for portal-based theme detection.
@@ -25,7 +24,7 @@ func (a *App) initThemeMonitor(ctx context.Context) {
 	// Emit initial theme value so the frontend can use it immediately
 	initialTheme := a.themeMonitor.GetTheme()
 	if initialTheme != platform.SystemThemeNoPreference {
-		wailsRuntime.EventsEmit(ctx, "theme:system-preference", string(initialTheme))
+		a.emitUI("theme:system-preference", string(initialTheme))
 	}
 
 	go a.processThemeEvents(ctx)
@@ -48,7 +47,7 @@ func (a *App) processThemeEvents(ctx context.Context) {
 			if !ok {
 				return
 			}
-			wailsRuntime.EventsEmit(a.ctx, "theme:system-preference", string(theme))
+			a.emitUI("theme:system-preference", string(theme))
 		}
 	}
 }

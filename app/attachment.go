@@ -223,7 +223,7 @@ func (a *App) SaveAttachmentAs(attachmentID string) (string, error) {
 func (a *App) openFile(path string) error {
 	if runtime.GOOS == "linux" && platform.IsFlatpak() {
 		if platform.IsDocPortalPath(path) {
-			wailsRuntime.EventsEmit(a.ctx, "flatpak:filesystem-dialog")
+			a.emitUI("flatpak:filesystem-dialog")
 			return nil // Don't open — portal FUSE path is broken for editing
 		}
 		return platform.PortalOpenFile(path)

@@ -25,6 +25,12 @@ type UndoContext interface {
 	// MoveMessagesToFolderWithoutUndo moves messages using the full move pipeline
 	// (IMAP + local DB) without pushing a new command onto the undo stack.
 	MoveMessagesToFolderWithoutUndo(messageIDs []string, destFolderID string) error
+	// CancelPendingOp removes a queued server-side op if it hasn't run yet.
+	// Reports false when the op already reached the server.
+	CancelPendingOp(opID string) (bool, error)
+	// RestoreMessages puts messages back in folderID at their original UIDs,
+	// reversing the local half of a move whose server op was cancelled.
+	RestoreMessages(originals []MessageUID, folderID string) error
 }
 
 // FlagChangeCommand handles read/star flag changes
@@ -133,15 +139,22 @@ type MoveCommand struct {
 	rfc822MessageIDs []string // Fallback lookup key for rows that couldn't be reconciled
 	sourceFolderID   string
 	destFolderID     string
-	settled          func() error // Blocks until the move's IMAP + destination sync finished
+	opID             string       // Queued server-side op, cancellable while pending
+	originals        []MessageUID // Pre-move folder/UID, for the cancel path
+}
+
+// MessageUID pairs a local message id with the server UID it held before the
+// move, so a cancelled move can be put back exactly as it was.
+type MessageUID struct {
+	ID  string `json:"id"`
+	UID uint32 `json:"uid"`
 }
 
 // NewMoveCommand creates a new MoveCommand.
 //
-// settled blocks until the originating move has finished its IMAP work and the
-// destination folder has synced, so Undo never tries to reverse a move the
-// server hasn't been told about yet. It may be nil, in which case Undo
-// proceeds immediately.
+// opID identifies the queued server-side op. While that op is still pending,
+// undoing is a local cancel: nothing has reached IMAP, so the messages just go
+// back. Once it has drained, undo falls back to a real reverse move.
 func NewMoveCommand(
 	undoCtx UndoContext,
 	accountID string,
@@ -150,7 +163,8 @@ func NewMoveCommand(
 	sourceFolderID string,
 	destFolderID string,
 	description string,
-	settled func() error,
+	opID string,
+	originals []MessageUID,
 ) *MoveCommand {
 	return &MoveCommand{
 		BaseCommand:      NewBaseCommand(description),
@@ -160,7 +174,8 @@ func NewMoveCommand(
 		rfc822MessageIDs: rfc822MessageIDs,
 		sourceFolderID:   sourceFolderID,
 		destFolderID:     destFolderID,
-		settled:          settled,
+		opID:             opID,
+		originals:        originals,
 	}
 }
 
@@ -175,17 +190,19 @@ func (c *MoveCommand) Execute() error { return nil }
 // fallback for rows that couldn't be reconciled (a message with no Message-ID
 // header, or a server that never reported the copy).
 func (c *MoveCommand) Undo() error {
-	// Reversing a move requires a real server UID, which only exists once the
-	// IMAP COPY has landed and the destination folder has synced. Undoing
-	// before that point would move the local row back while leaving the
-	// message in the destination folder on the server — the next sync would
-	// silently undo the undo.
-	if c.settled != nil {
-		if err := c.settled(); err != nil {
-			return fmt.Errorf("move still in flight: %w", err)
-		}
+	// Fast path: the server was never told. Cancel the queued op and put the
+	// local rows back at the UIDs they still hold on the server. No network,
+	// no waiting, nothing to reconcile.
+	cancelled, err := c.undoCtx.CancelPendingOp(c.opID)
+	if err != nil {
+		return fmt.Errorf("failed to cancel queued move: %w", err)
+	}
+	if cancelled {
+		return c.undoCtx.RestoreMessages(c.originals, c.sourceFolderID)
 	}
 
+	// Slow path: the op drained, so the message really is in the destination
+	// folder on the server and has to be moved back.
 	localMsgIDs, err := c.undoCtx.ResolveMessagesInFolder(
 		c.accountID, c.destFolderID, c.localMessageIDs, c.rfc822MessageIDs,
 	)

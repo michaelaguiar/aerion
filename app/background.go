@@ -12,7 +12,6 @@ import (
 	"github.com/hkdb/aerion/internal/notification"
 	"github.com/hkdb/aerion/internal/platform"
 	"github.com/hkdb/aerion/internal/sync"
-	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 // ============================================================================
@@ -35,14 +34,14 @@ func (a *App) initBackgroundSync(ctx context.Context) {
 	// Set callback for sync completion (so frontend clears progress)
 	a.syncScheduler.SetSyncCompletedCallback(func(accountID, folderID string, err error) {
 		if err != nil {
-			wailsRuntime.EventsEmit(a.ctx, "folder:syncError", map[string]interface{}{
+			a.emitUI("folder:syncError", map[string]interface{}{
 				"accountId": accountID,
 				"folderId":  folderID,
 				"error":     err.Error(),
 			})
 			return
 		}
-		wailsRuntime.EventsEmit(a.ctx, "folder:synced", map[string]interface{}{
+		a.emitUI("folder:synced", map[string]interface{}{
 			"accountId": accountID,
 			"folderId":  folderID,
 		})
@@ -50,7 +49,7 @@ func (a *App) initBackgroundSync(ctx context.Context) {
 		// scheduled sync (the manual SyncFolder path emits this at
 		// app/sync.go:110; the scheduler path was missing it).
 		if folderObj, ferr := a.folderStore.Get(folderID); ferr == nil && folderObj != nil {
-			wailsRuntime.EventsEmit(a.ctx, "folders:countsChanged", map[string]int{
+			a.emitUI("folders:countsChanged", map[string]int{
 				folderID: folderObj.UnreadCount,
 			})
 		}
@@ -255,7 +254,7 @@ func (a *App) handleIdleNewMail(event imap.MailEvent) {
 		log.Error().Err(err).Str("accountID", event.AccountID).Msg("Failed to sync after IDLE notification")
 		// Emit folder:synced to clear syncing state even on error
 		if folderID != "" {
-			wailsRuntime.EventsEmit(a.ctx, "folder:synced", map[string]interface{}{
+			a.emitUI("folder:synced", map[string]interface{}{
 				"accountId": event.AccountID,
 				"folderId":  folderID,
 			})
@@ -295,14 +294,14 @@ func (a *App) handleIdleNewMail(event imap.MailEvent) {
 				// Only emit messages:updated if folder:synced wasn't already emitted
 				// (both trigger identical reloads in MessageList and ConversationViewer)
 				if !folderSynced {
-					wailsRuntime.EventsEmit(a.ctx, "messages:updated", map[string]interface{}{
+					a.emitUI("messages:updated", map[string]interface{}{
 						"accountId": event.AccountID,
 						"folderId":  fID,
 					})
 				}
 				// Emit folder counts changed so sidebar unread badge updates
 				if updatedFolder, err := a.folderStore.Get(fID); err == nil && updatedFolder != nil {
-					wailsRuntime.EventsEmit(a.ctx, "folders:countsChanged", map[string]int{
+					a.emitUI("folders:countsChanged", map[string]int{
 						fID: updatedFolder.UnreadCount,
 					})
 				}
@@ -312,7 +311,7 @@ func (a *App) handleIdleNewMail(event imap.MailEvent) {
 			defer func() {
 				if r := recover(); r != nil {
 					log.Error().Interface("panic", r).Str("folder", fID).Msg("IDLE body fetch goroutine panicked")
-					wailsRuntime.EventsEmit(a.ctx, "folder:syncError", map[string]interface{}{
+					a.emitUI("folder:syncError", map[string]interface{}{
 						"accountId": event.AccountID,
 						"folderId":  fID,
 						"error":     fmt.Sprintf("body fetch panic: %v", r),
@@ -326,14 +325,14 @@ func (a *App) handleIdleNewMail(event imap.MailEvent) {
 					// Cancelled - not an error, emit synced
 					log.Debug().Str("folder", fID).Msg("IDLE body fetch cancelled")
 					folderSynced = true
-					wailsRuntime.EventsEmit(a.ctx, "folder:synced", map[string]interface{}{
+					a.emitUI("folder:synced", map[string]interface{}{
 						"accountId": event.AccountID,
 						"folderId":  fID,
 					})
 				} else {
 					// Actual error - emit error event
 					log.Error().Err(bodyErr).Str("folder", fID).Msg("Background body fetch failed after IDLE sync")
-					wailsRuntime.EventsEmit(a.ctx, "folder:syncError", map[string]interface{}{
+					a.emitUI("folder:syncError", map[string]interface{}{
 						"accountId": event.AccountID,
 						"folderId":  fID,
 						"error":     bodyErr.Error(),
@@ -342,7 +341,7 @@ func (a *App) handleIdleNewMail(event imap.MailEvent) {
 			} else {
 				// Success
 				folderSynced = true
-				wailsRuntime.EventsEmit(a.ctx, "folder:synced", map[string]interface{}{
+				a.emitUI("folder:synced", map[string]interface{}{
 					"accountId": event.AccountID,
 					"folderId":  fID,
 				})
@@ -487,7 +486,7 @@ func (a *App) reconcileInboxFlags(accountID string, attempt int) {
 	// Always emit folder:synced: SyncFolderFlags emits the progress that drives
 	// the sidebar indicator, so we emit the matching completion (clears the bar)
 	// and reload the message list with the updated flags.
-	wailsRuntime.EventsEmit(a.ctx, "folder:synced", map[string]interface{}{
+	a.emitUI("folder:synced", map[string]interface{}{
 		"accountId": accountID,
 		"folderId":  folderID,
 	})
@@ -499,7 +498,7 @@ func (a *App) reconcileInboxFlags(accountID string, attempt int) {
 
 	// Update the sidebar unread badge.
 	if updated, ferr := a.folderStore.Get(folderID); ferr == nil && updated != nil {
-		wailsRuntime.EventsEmit(a.ctx, "folders:countsChanged", map[string]int{
+		a.emitUI("folders:countsChanged", map[string]int{
 			folderID: updated.UnreadCount,
 		})
 	}
@@ -538,7 +537,7 @@ func (a *App) handleIdleExpunge(accountID string) {
 	// Always emit folder:synced: the sync emits progress that drives the sidebar
 	// indicator, so we emit the matching completion (clears the bar) and reload
 	// the message list with any deleted rows removed.
-	wailsRuntime.EventsEmit(a.ctx, "folder:synced", map[string]interface{}{
+	a.emitUI("folder:synced", map[string]interface{}{
 		"accountId": accountID,
 		"folderId":  folderID,
 	})
@@ -550,7 +549,7 @@ func (a *App) handleIdleExpunge(accountID string) {
 
 	// Update the sidebar unread badge.
 	if updated, ferr := a.folderStore.Get(folderID); ferr == nil && updated != nil {
-		wailsRuntime.EventsEmit(a.ctx, "folders:countsChanged", map[string]int{
+		a.emitUI("folders:countsChanged", map[string]int{
 			folderID: updated.UnreadCount,
 		})
 	}
@@ -649,7 +648,7 @@ func (a *App) initNotifications(ctx context.Context) {
 				Str("extensionId", data.ExtensionID).
 				Str("path", data.Path).
 				Msg("Notification clicked, routing to extension")
-			wailsRuntime.EventsEmit(a.ctx, "extension:open", map[string]interface{}{
+			a.emitUI("extension:open", map[string]interface{}{
 				"extensionId": data.ExtensionID,
 				"path":        data.Path,
 			})
@@ -661,7 +660,7 @@ func (a *App) initNotifications(ctx context.Context) {
 			Str("folderId", data.FolderID).
 			Str("threadId", data.ThreadID).
 			Msg("Notification clicked, navigating to message")
-		wailsRuntime.EventsEmit(a.ctx, "notification:clicked", map[string]interface{}{
+		a.emitUI("notification:clicked", map[string]interface{}{
 			"accountId": data.AccountID,
 			"folderId":  data.FolderID,
 			"threadId":  data.ThreadID,
@@ -719,13 +718,20 @@ func (a *App) processNetworkEvents(ctx context.Context) {
 
 			if event.Connected {
 				log.Info().Msg("Network connectivity restored — starting full sync")
-				wailsRuntime.EventsEmit(a.ctx, "network:online", nil)
+				a.emitUI("network:online", nil)
 				// Bus event for Go-side subscribers (e.g., calendar Syncer).
 				_ = a.coreEventBus().Publish("system:network-online", nil)
+				// Mutations queued while offline have been failing and backing
+				// off; reconnecting is the moment they can finally land, so
+				// drain before syncing rather than letting the sync observe a
+				// server that hasn't heard about them yet.
+				if a.opDrainer != nil {
+					a.opDrainer.Wake()
+				}
 				a.syncAfterWake()
 			} else {
 				log.Info().Msg("Network connectivity lost — stopping IDLE and clearing pool")
-				wailsRuntime.EventsEmit(a.ctx, "network:offline", nil)
+				a.emitUI("network:offline", nil)
 				_ = a.coreEventBus().Publish("system:network-offline", nil)
 
 				if a.idleManager != nil {
@@ -842,7 +848,7 @@ func (a *App) handleSystemWake() {
 		return
 	}
 
-	wailsRuntime.EventsEmit(a.ctx, "network:online", nil)
+	a.emitUI("network:online", nil)
 
 	// Publish to the host EventBus so extensions can sync on wake. Separate
 	// event name from `network:online` (which is the frontend-facing name);

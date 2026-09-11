@@ -10,8 +10,11 @@ import (
 	"runtime"
 	"strings"
 	goSync "sync"
+	"sync/atomic"
 	"time"
 
+	extcalendarbe "github.com/hkdb/aerion/extensions/calendar/backend"
+	extcontactsbe "github.com/hkdb/aerion/extensions/contacts/backend"
 	"github.com/hkdb/aerion/internal/account"
 	"github.com/hkdb/aerion/internal/appstate"
 	"github.com/hkdb/aerion/internal/carddav"
@@ -21,8 +24,6 @@ import (
 	"github.com/hkdb/aerion/internal/credentials"
 	"github.com/hkdb/aerion/internal/database"
 	"github.com/hkdb/aerion/internal/draft"
-	extcalendarbe "github.com/hkdb/aerion/extensions/calendar/backend"
-	extcontactsbe "github.com/hkdb/aerion/extensions/contacts/backend"
 	extauth "github.com/hkdb/aerion/internal/extensions/auth"
 	extcompose "github.com/hkdb/aerion/internal/extensions/compose"
 	extmail "github.com/hkdb/aerion/internal/extensions/mail"
@@ -35,9 +36,10 @@ import (
 	"github.com/hkdb/aerion/internal/message"
 	"github.com/hkdb/aerion/internal/notification"
 	"github.com/hkdb/aerion/internal/oauth2"
+	"github.com/hkdb/aerion/internal/ops"
+	"github.com/hkdb/aerion/internal/pgp"
 	"github.com/hkdb/aerion/internal/platform"
 	"github.com/hkdb/aerion/internal/settings"
-	"github.com/hkdb/aerion/internal/pgp"
 	"github.com/hkdb/aerion/internal/smime"
 	"github.com/hkdb/aerion/internal/sync"
 	"github.com/hkdb/aerion/internal/undo"
@@ -192,6 +194,12 @@ type App struct {
 
 	ctx context.Context
 
+	// Set once the webview is being torn down. Wails delivers events by
+	// evaluating JavaScript inside the webview, so any emit after this point
+	// hits a destroyed WebKitWebView and GTK logs a CRITICAL assertion.
+	// Consulted by emitUI; see its comment.
+	uiTornDown atomic.Bool
+
 	// ready is the backend-up signal the frontend polls before mounting the
 	// main app. False until Startup completes. The boot splash in
 	// index.html stays visible while ready is false; flipping it true is
@@ -238,14 +246,14 @@ type App struct {
 	// into App via its Bridge struct (declared at the top of this struct
 	// definition); the *Extension field below is the lightweight lifecycle
 	// handle the host's knownExtensions Register loop iterates.
-	authBroker       *extauth.Broker      // coreapi.Auth impl for extensions
-	mailAPI          *extmail.API         // coreapi.Mail impl wrapping core stores
-	composerAPI      *extcompose.API      // coreapi.Composer impl wrapping OpenComposerWindow
-	uiRegistry       *extui.Registry      // coreapi.UI impl: rail tabs, account-setup hooks, ...
-	contactsExt      *extcontactsbe.Extension // Contacts lifecycle handle (manifest + Register only)
-	calendarExt      *extcalendarbe.Extension // Calendar lifecycle handle (manifest + Register only)
-	knownExtensions  []coreapi.Extension      // all first-party extensions, iterated by ListExtensions
-	extensionUnregs  []coreapi.Unregister     // teardown funcs returned from each Extension.Register
+	authBroker      *extauth.Broker          // coreapi.Auth impl for extensions
+	mailAPI         *extmail.API             // coreapi.Mail impl wrapping core stores
+	composerAPI     *extcompose.API          // coreapi.Composer impl wrapping OpenComposerWindow
+	uiRegistry      *extui.Registry          // coreapi.UI impl: rail tabs, account-setup hooks, ...
+	contactsExt     *extcontactsbe.Extension // Contacts lifecycle handle (manifest + Register only)
+	calendarExt     *extcalendarbe.Extension // Calendar lifecycle handle (manifest + Register only)
+	knownExtensions []coreapi.Extension      // all first-party extensions, iterated by ListExtensions
+	extensionUnregs []coreapi.Unregister     // teardown funcs returned from each Extension.Register
 
 	// coreapi.EventBus implementation, lazily constructed on first
 	// Core.Events() call (via eventBusInitOnce). Extensions consume via
@@ -277,6 +285,11 @@ type App struct {
 
 	// Undo system
 	undoStack *undo.Stack
+
+	// Durable outbox for server-side mutations, and the worker that drains it.
+	// Actions apply locally and enqueue here; see internal/ops.
+	opStore   *ops.Store
+	opDrainer *ops.Drainer
 
 	// IPC for multi-window support (composer windows)
 	ipcServer   ipc.Server
@@ -324,7 +337,7 @@ type App struct {
 
 	// Draft IMAP sync goroutine tracking — cancel in-flight syncDraftToIMAP
 	draftSyncContexts map[string]context.CancelFunc // keyed by draft ID
-	draftSyncDone     map[string]chan struct{}       // closed when goroutine exits
+	draftSyncDone     map[string]chan struct{}      // closed when goroutine exits
 
 	// Sleep/wake detection for auto-sync on wake
 	sleepWakeMonitor platform.SleepWakeMonitor
@@ -359,6 +372,18 @@ func NewApp(debugModeFn func() bool, useDirectDBus bool) *App {
 	return &App{
 		debugMode:     debugModeFn,
 		useDirectDBus: useDirectDBus,
+
+		// Built here rather than partway through Startup. Background workers
+		// touch these, and the op drainer in particular can execute a
+		// mutation persisted by a previous run before Startup has finished
+		// wiring everything up — a nil map there is a panic, not a bug that
+		// waits to be noticed.
+		syncContexts:      make(map[string]context.CancelFunc),
+		syncLastRequest:   make(map[string]time.Time),
+		ownFlagChangeAt:   make(map[string]time.Time),
+		ownExpungeAt:      make(map[string]time.Time),
+		draftSyncContexts: make(map[string]context.CancelFunc),
+		draftSyncDone:     make(map[string]chan struct{}),
 	}
 }
 
@@ -514,6 +539,41 @@ func (a *App) Preflight() error {
 // succeed inside a narrow window after the destination sync.
 const undoRetention = 5 * time.Minute
 
+// opFlushTimeout bounds how long shutdown waits for queued mailbox operations
+// to reach the server. Anything still queued past this survives in the
+// database and runs at next startup, so the cost of giving up is delay, not
+// data loss.
+const opFlushTimeout = 5 * time.Second
+
+// opStopTimeout bounds the wait for the background drain loop to finish
+// whatever it is in the middle of before the flush takes over.
+const opStopTimeout = 3 * time.Second
+
+// emitUI delivers a Wails event to the frontend, unless the webview is already
+// gone.
+//
+// Wails implements EventsEmit by evaluating JavaScript in the webview. Once
+// shutdown has begun that webview is being destroyed, and every late emit
+// produces:
+//
+//	CRITICAL: webkitWebViewEvaluateJavascriptInternal: assertion
+//	'WEBKIT_IS_WEB_VIEW(webView)' failed
+//
+// Background work can always outlive the window — a sync finishing, a queued
+// operation draining, a folder count landing — so the guard lives here at the
+// single choke point rather than at each of the call sites.
+func (a *App) emitUI(event string, optionalData ...interface{}) {
+	if a.uiTornDown.Load() {
+		// Logged so a stray critical during teardown can be attributed: if the
+		// assertion fires without a matching drop here, the JavaScript is
+		// coming from something other than an event emit.
+		log := logging.WithComponent("app")
+		log.Debug().Str("event", event).Msg("Dropped event; webview is gone")
+		return
+	}
+	wailsRuntime.EventsEmit(a.ctx, event, optionalData...)
+}
+
 // shuttingDown tracks if shutdown has been initiated to prevent multiple triggers
 var shuttingDown bool
 
@@ -613,7 +673,7 @@ func (a *App) Startup(ctx context.Context) {
 
 	// Set up sync progress callback to emit events to frontend
 	a.syncEngine.SetProgressCallback(func(progress sync.SyncProgress) {
-		wailsRuntime.EventsEmit(ctx, "sync:progress", map[string]interface{}{
+		a.emitUI("sync:progress", map[string]interface{}{
 			"accountId": progress.AccountID,
 			"folderId":  progress.FolderID,
 			"fetched":   progress.Fetched,
@@ -716,8 +776,18 @@ func (a *App) Startup(ctx context.Context) {
 	// Start CardDAV background sync scheduler
 	a.carddavScheduler.Start(ctx)
 
-	// Initialize undo stack (max 50 commands, 30 second timeout)
+	// Initialize undo stack (max 50 commands, see undoRetention)
 	a.undoStack = undo.NewStack(50, undoRetention)
+
+	// Durable mutation outbox. Started before any action can be taken so a
+	// mutation is never enqueued with nothing to drain it, and so ops stranded
+	// by a previous run are released and retried at startup.
+	a.opStore = ops.NewStore(db)
+	a.opDrainer = ops.NewDrainer(a.opStore, a, logging.WithComponent("app.ops"))
+	// Started at the end of Startup, not here: Start releases ops stranded by
+	// a previous run and begins executing them immediately, and those run
+	// against the full app — IMAP pool, sync engine, folder store. Enqueueing
+	// before then is safe; the drainer picks it up when it starts.
 
 	// OAuth2 manager was constructed earlier (before the Auth Broker, which
 	// captures it). See the earlier guarded init above for the rationale.
@@ -759,13 +829,8 @@ func (a *App) Startup(ctx context.Context) {
 	// Initialize FTS indexer for full-text search
 	a.ftsIndexer = message.NewFTSIndexer(db.DB)
 
-	// Initialize sync context tracking for cancel-and-restart
-	a.syncContexts = make(map[string]context.CancelFunc)
-	a.syncLastRequest = make(map[string]time.Time)
-	a.ownFlagChangeAt = make(map[string]time.Time)
-	a.ownExpungeAt = make(map[string]time.Time)
-	a.draftSyncContexts = make(map[string]context.CancelFunc)
-	a.draftSyncDone = make(map[string]chan struct{})
+	// Sync context tracking, IDLE echo suppression and draft sync maps are
+	// constructed in NewApp — see the comment there.
 
 	// IMPORTANT: backend-ready signal. The frontend's main.ts waits for the
 	// "app:ready" event (with IsReady() as a one-shot fallback) and will NOT
@@ -786,7 +851,7 @@ func (a *App) Startup(ctx context.Context) {
 	// the normal case, IsReady for the "event fired before listener
 	// registered" race.
 	a.ready = true
-	wailsRuntime.EventsEmit(a.ctx, "app:ready")
+	a.emitUI("app:ready")
 
 	// Initialize desktop notifications with click handling
 	a.initNotifications(ctx)
@@ -803,7 +868,7 @@ func (a *App) Startup(ctx context.Context) {
 		if total > 0 {
 			percentage = (indexed * 100) / total
 		}
-		wailsRuntime.EventsEmit(ctx, "fts:progress", map[string]interface{}{
+		a.emitUI("fts:progress", map[string]interface{}{
 			"folderId":   folderID,
 			"indexed":    indexed,
 			"total":      total,
@@ -812,7 +877,7 @@ func (a *App) Startup(ctx context.Context) {
 	})
 
 	a.ftsIndexer.SetCompleteCallback(func(folderID string) {
-		wailsRuntime.EventsEmit(ctx, "fts:complete", map[string]interface{}{
+		a.emitUI("fts:complete", map[string]interface{}{
 			"folderId": folderID,
 		})
 	})
@@ -822,14 +887,14 @@ func (a *App) Startup(ctx context.Context) {
 		defer recoverPanic("app", "FTS indexing")
 		time.Sleep(5 * time.Second)
 		log.Info().Msg("Starting background FTS indexing")
-		wailsRuntime.EventsEmit(ctx, "fts:indexing", map[string]interface{}{
+		a.emitUI("fts:indexing", map[string]interface{}{
 			"status": "started",
 		})
 		if err := a.ftsIndexer.IndexAllFolders(ctx); err != nil {
 			log.Error().Err(err).Msg("Background FTS indexing failed")
 		} else {
 			log.Info().Msg("Background FTS indexing completed")
-			wailsRuntime.EventsEmit(ctx, "fts:indexing", map[string]interface{}{
+			a.emitUI("fts:indexing", map[string]interface{}{
 				"status": "completed",
 			})
 		}
@@ -837,6 +902,11 @@ func (a *App) Startup(ctx context.Context) {
 
 	// Initialize autostart manager
 	a.autostartMgr = platform.NewAutostartManager()
+
+	// Everything the executor touches is wired now, so it is safe to start
+	// draining. This also releases and retries ops stranded by a previous run,
+	// which execute against the full app immediately.
+	a.opDrainer.Start(ctx)
 
 	log.Info().Msg("Aerion started successfully")
 }
@@ -877,17 +947,29 @@ func (a *App) BeforeClose(ctx context.Context) bool {
 	shuttingDown = true
 
 	// Emit event to show shutdown overlay
-	wailsRuntime.EventsEmit(a.ctx, "app:shutting-down")
-
-	// Schedule actual quit after UI has time to render
-	go func() {
-		defer recoverPanic("app", "shutdown")
-		time.Sleep(150 * time.Millisecond)
-		wailsRuntime.Quit(a.ctx)
-	}()
+	a.beginQuit()
 
 	// Prevent immediate close
 	return true
+}
+
+// beginQuit shows the shutdown overlay, then tears the app down.
+//
+// The ordering matters. Wails destroys the webview inside Quit, while
+// OnShutdown (App.Shutdown) does not run until afterwards — so a guard set
+// there is set too late, and anything emitting in between evaluates JS against
+// a destroyed WebKitWebView. uiTornDown is therefore raised here, immediately
+// before Quit: the overlay is the last thing the frontend needs to hear about.
+func (a *App) beginQuit() {
+	a.emitUI("app:shutting-down")
+
+	go func() {
+		defer recoverPanic("app", "shutdown")
+		// Give the overlay a frame to render before the window goes away.
+		time.Sleep(150 * time.Millisecond)
+		a.uiTornDown.Store(true)
+		wailsRuntime.Quit(a.ctx)
+	}()
 }
 
 // NotifyStartupComplete signals the desktop environment that startup is done.
@@ -908,7 +990,7 @@ func (a *App) ShowWindow() {
 	a.windowHidden = false
 
 	// Emit event so frontend can also attempt to focus
-	wailsRuntime.EventsEmit(a.ctx, "window:show")
+	a.emitUI("window:show")
 }
 
 // CloseWindow handles the window close button click.
@@ -932,12 +1014,7 @@ func (a *App) CloseWindow() {
 
 	log := logging.WithComponent("app")
 	log.Info().Msg("Window close requested, shutting down")
-	wailsRuntime.EventsEmit(a.ctx, "app:shutting-down")
-	go func() {
-		defer recoverPanic("app", "shutdown")
-		time.Sleep(150 * time.Millisecond)
-		wailsRuntime.Quit(a.ctx)
-	}()
+	a.beginQuit()
 }
 
 // QuitApp forces a real quit, bypassing background mode.
@@ -950,12 +1027,7 @@ func (a *App) QuitApp() {
 
 	log := logging.WithComponent("app")
 	log.Info().Msg("Quit requested")
-	wailsRuntime.EventsEmit(a.ctx, "app:shutting-down")
-	go func() {
-		defer recoverPanic("app", "shutdown")
-		time.Sleep(150 * time.Millisecond)
-		wailsRuntime.Quit(a.ctx)
-	}()
+	a.beginQuit()
 }
 
 // GetStartHiddenActive returns true if the window should remain hidden on startup.
@@ -984,6 +1056,33 @@ func (a *App) InitiateShutdown() {
 // Shutdown is called when the app is closing
 func (a *App) Shutdown(ctx context.Context) {
 	log := logging.WithComponent("app")
+
+	// Nothing may reach the frontend from here on: the webview is being
+	// destroyed, and the shutdown flush below deliberately runs work that would
+	// otherwise emit. See emitUI.
+	a.uiTornDown.Store(true)
+
+	// Flush queued mutations before anything is torn down. A move or delete
+	// sitting in its defer window has already been applied locally and shown to
+	// the user; dropping it on exit would let the next sync resurrect the
+	// message. Bounded so a dead server can't block quitting.
+	if a.opDrainer != nil {
+		// Stop the background loop first so the flush is the only thing
+		// executing ops; two of them racing for the IMAP pool is the last
+		// thing a process trying to exit needs.
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), opStopTimeout)
+		a.opDrainer.Stop(stopCtx)
+		stopCancel()
+
+		if n, err := a.opStore.PendingCount(); err == nil && n > 0 {
+			log.Info().Int("count", n).Msg("Flushing queued mailbox operations before shutdown")
+			flushCtx, cancel := context.WithTimeout(context.Background(), opFlushTimeout)
+			if err := a.opDrainer.Flush(flushCtx); err != nil {
+				log.Warn().Err(err).Msg("Queued operations remain; they will run at next startup")
+			}
+			cancel()
+		}
+	}
 
 	// Broadcast shutdown to all composer windows
 	if a.ipcServer != nil {

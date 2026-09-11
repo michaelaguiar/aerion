@@ -16,13 +16,12 @@ import (
 	"github.com/hkdb/aerion/internal/pgp"
 	"github.com/hkdb/aerion/internal/smime"
 	"github.com/hkdb/aerion/internal/smtp"
-	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 // draftBodyPayload is used to serialize body fields for encrypted draft storage
 type draftBodyPayload struct {
 	BodyHTML    string            `json:"bodyHtml"`
-	BodyText   string            `json:"bodyText"`
+	BodyText    string            `json:"bodyText"`
 	Attachments []smtp.Attachment `json:"attachments,omitempty"`
 }
 
@@ -626,7 +625,7 @@ func (a *App) syncDraftToIMAP(ctx context.Context, localDraft *draft.Draft, msg 
 	log := logging.WithComponent("app")
 
 	emitStatus := func(status draft.SyncStatus, imapUID uint32, syncError string) {
-		wailsRuntime.EventsEmit(a.ctx, "draft:syncStatusChanged", map[string]interface{}{
+		a.emitUI("draft:syncStatusChanged", map[string]interface{}{
 			"draftId":    localDraft.ID,
 			"syncStatus": status,
 			"imapUid":    imapUID,
@@ -726,7 +725,7 @@ func (a *App) DeleteDraft(draftID string) error {
 
 	// Notify frontend to refresh the message list for this folder
 	if draftsFolder != nil {
-		wailsRuntime.EventsEmit(a.ctx, "messages:updated", map[string]interface{}{
+		a.emitUI("messages:updated", map[string]interface{}{
 			"accountId": d.AccountID,
 			"folderId":  draftsFolder.ID,
 		})
