@@ -601,6 +601,19 @@ func (s *Store) Create(m *Message) error {
 // Upsert inserts a message or updates it if a row with the same (folder_id, uid) already exists.
 // This handles cases where a previous copy was deleted but the stale row remains, or where
 // the IMAP server reuses UIDs after EXPUNGE.
+//
+// Two invariants this function must preserve, both load-bearing for anything
+// holding a reference to a message (undo commands, attachment rows via
+// attachments.message_id ON DELETE CASCADE, open viewers):
+//
+//   - Identity is stable. On conflict the existing row's id is KEPT, not
+//     replaced with the caller's freshly-minted UUID. m.ID is rewritten to the
+//     id that actually persisted, so callers observe the real row.
+//   - A header-only sync never discards a cached body. The conflict clause
+//     only copies body_text/body_html/body_fetched when the incoming row
+//     actually carries a body; otherwise the stored body survives. This is the
+//     "body_fetched resets via the header Upsert's ON CONFLICT clause"
+//     corruption called out in folderlock.go.
 func (s *Store) Upsert(m *Message) error {
 	if m.ID == "" {
 		m.ID = uuid.New().String()
@@ -618,7 +631,7 @@ func (s *Store) Upsert(m *Message) error {
 			read_receipt_to, read_receipt_handled, received_at
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(folder_id, uid) DO UPDATE SET
-			id=excluded.id, account_id=excluded.account_id,
+			account_id=excluded.account_id,
 			message_id=excluded.message_id, in_reply_to=excluded.in_reply_to,
 			references_list=excluded.references_list, thread_id=excluded.thread_id,
 			subject=excluded.subject, from_name=excluded.from_name, from_email=excluded.from_email,
@@ -628,13 +641,15 @@ func (s *Store) Upsert(m *Message) error {
 			is_answered=excluded.is_answered, is_forwarded=excluded.is_forwarded,
 			is_draft=excluded.is_draft, is_deleted=excluded.is_deleted,
 			size=excluded.size, has_attachments=excluded.has_attachments,
-			body_text=excluded.body_text, body_html=excluded.body_html,
-			body_fetched=excluded.body_fetched,
+			body_text=CASE WHEN excluded.body_fetched THEN excluded.body_text ELSE messages.body_text END,
+			body_html=CASE WHEN excluded.body_fetched THEN excluded.body_html ELSE messages.body_html END,
+			body_fetched=CASE WHEN excluded.body_fetched THEN 1 ELSE messages.body_fetched END,
 			read_receipt_to=excluded.read_receipt_to, read_receipt_handled=excluded.read_receipt_handled,
 			received_at=excluded.received_at
+		RETURNING id
 	`
 
-	_, err := s.db.Exec(query,
+	err := s.db.QueryRow(query,
 		m.ID, m.AccountID, m.FolderID, m.UID,
 		nullString(m.MessageID), nullString(m.InReplyTo), nullString(m.References), nullString(m.ThreadID),
 		m.Subject, m.FromName, m.FromEmail,
@@ -645,12 +660,93 @@ func (s *Store) Upsert(m *Message) error {
 		nullString(m.BodyText), nullString(m.BodyHTML), m.BodyFetched,
 		nullString(m.ReadReceiptTo), m.ReadReceiptHandled,
 		m.ReceivedAt,
-	)
+	).Scan(&m.ID)
 	if err != nil {
 		return fmt.Errorf("failed to upsert message: %w", err)
 	}
 
 	return nil
+}
+
+// ReconcileMovedMessage rebinds a locally-moved message to its real server UID
+// instead of letting the destination sync insert a second row for it.
+//
+// MoveMessages parks moved rows at uid = -rowid until the IMAP COPY lands and
+// the destination folder syncs. Without this step that sync inserts a fresh row
+// (new UUID) for the same message and DeleteTempUIDs drops the original —
+// which cascades the message's attachment rows away, throws out its cached
+// body, and invalidates every reference anything held to it.
+//
+// Returns true when m was matched onto an existing temp row; m.ID is then set
+// to that row's id and its header fields are refreshed in place. Body columns
+// are deliberately untouched. Returns false when there is nothing to reconcile
+// (no Message-ID, no parked row, or the real UID is already present), leaving
+// the caller to Upsert as normal.
+func (s *Store) ReconcileMovedMessage(m *Message) (bool, error) {
+	// Messages with no Message-ID header can't be matched across the move;
+	// they fall back to the insert path.
+	if m.MessageID == "" {
+		return false, nil
+	}
+
+	// If the real UID is already present in this folder, the normal upsert
+	// path owns the row — reconciling would collide with UNIQUE(folder_id, uid).
+	var existing string
+	err := s.db.QueryRow(
+		`SELECT id FROM messages WHERE folder_id = ? AND uid = ?`,
+		m.FolderID, m.UID,
+	).Scan(&existing)
+	if err == nil {
+		return false, nil
+	}
+	if err != sql.ErrNoRows {
+		return false, fmt.Errorf("failed to probe destination uid: %w", err)
+	}
+
+	// Oldest parked row first, so a repeated move of the same Message-ID
+	// reconciles in the order the moves happened.
+	var parkedID string
+	err = s.db.QueryRow(
+		`SELECT id FROM messages
+		 WHERE account_id = ? AND folder_id = ? AND message_id = ? AND uid < 0
+		 ORDER BY uid DESC LIMIT 1`,
+		m.AccountID, m.FolderID, m.MessageID,
+	).Scan(&parkedID)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("failed to find parked message: %w", err)
+	}
+
+	// Adopt the real UID and refresh headers/flags in place. body_text,
+	// body_html and body_fetched are omitted on purpose: the parked row
+	// already holds the body we fetched before the move.
+	_, err = s.db.Exec(`
+		UPDATE messages SET
+			uid = ?, in_reply_to = ?, references_list = ?, thread_id = ?,
+			subject = ?, from_name = ?, from_email = ?,
+			to_list = ?, cc_list = ?, bcc_list = ?, reply_to = ?, date = ?,
+			snippet = ?, is_read = ?, is_starred = ?, is_answered = ?, is_forwarded = ?,
+			is_draft = ?, is_deleted = ?, size = ?, has_attachments = ?,
+			read_receipt_to = ?, read_receipt_handled = ?
+		WHERE id = ?`,
+		m.UID,
+		nullString(m.InReplyTo), nullString(m.References), nullString(m.ThreadID),
+		m.Subject, m.FromName, m.FromEmail,
+		nullString(m.ToList), nullString(m.CcList), nullString(m.BccList), nullString(m.ReplyTo),
+		m.Date, nullString(m.Snippet),
+		m.IsRead, m.IsStarred, m.IsAnswered, m.IsForwarded,
+		m.IsDraft, m.IsDeleted, m.Size, m.HasAttachments,
+		nullString(m.ReadReceiptTo), m.ReadReceiptHandled,
+		parkedID,
+	)
+	if err != nil {
+		return false, fmt.Errorf("failed to reconcile moved message: %w", err)
+	}
+
+	m.ID = parkedID
+	return true, nil
 }
 
 // Update updates an existing message
@@ -2005,6 +2101,42 @@ func (s *Store) DeleteTempUIDs(folderID string) error {
 		return fmt.Errorf("failed to delete temp UID messages: %w", err)
 	}
 	return nil
+}
+
+// FilterIDsInFolder returns the subset of ids that still exist in folderID.
+// Used to confirm a held message reference is still valid before acting on it.
+func (s *Store) FilterIDsInFolder(folderID string, ids []string) ([]string, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+
+	placeholders := make([]string, len(ids))
+	args := []interface{}{folderID}
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+
+	query := fmt.Sprintf(
+		"SELECT id FROM messages WHERE folder_id = ? AND id IN (%s)",
+		strings.Join(placeholders, ", "),
+	)
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to filter message IDs: %w", err)
+	}
+	defer rows.Close()
+
+	var found []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("failed to scan message ID: %w", err)
+		}
+		found = append(found, id)
+	}
+	return found, rows.Err()
 }
 
 // GetIDsByMessageIDs finds local DB message IDs by RFC822 Message-ID header and folder.

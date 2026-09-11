@@ -1553,10 +1553,18 @@
     }
   }
 
+  // Undo waits for the original move to reach the server before reversing it,
+  // so it can take a beat. Without this guard a second Ctrl+Z during that wait
+  // would pop the *next* command off the stack and undo two actions.
+  let undoInFlight = false
+
   async function handleUndo() {
+    if (undoInFlight) return
     // Silent no-op when the undo stack is empty (e.g. Ctrl+Z with nothing to
     // undo) instead of surfacing an error toast.
     if (!(await CanUndo())) return
+
+    undoInFlight = true
     try {
       const description = await Undo()
       addToast({ type: 'success', message: $_('toast.undone', { values: { description } }) })
@@ -1564,6 +1572,8 @@
     } catch (err) {
       console.error('Undo failed:', err)
       addToast({ type: 'error', message: $_('toast.undoFailed') })
+    } finally {
+      undoInFlight = false
     }
   }
 </script>

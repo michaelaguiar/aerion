@@ -838,10 +838,21 @@ func (e *Engine) fetchMessageHeaders(ctx context.Context, client *imapclient.Cli
 		// Parse flags using shared helper
 		applyFlagsToMessage(m, flags)
 
-		// Save to store immediately (don't wait for all messages)
-		if err := e.messageStore.Upsert(m); err != nil {
-			e.log.Warn().Err(err).Uint32("uid", m.UID).Msg("Failed to save message header")
-			continue
+		// A message we moved here ourselves is already in this folder, parked
+		// at a negative UID until the server told us its real one. Rebind that
+		// row rather than inserting a second copy — the parked row owns the
+		// cached body, the attachment rows, and the id anything else is
+		// holding. Falls through to Upsert when there's nothing parked.
+		reconciled, recErr := e.messageStore.ReconcileMovedMessage(m)
+		if recErr != nil {
+			e.log.Warn().Err(recErr).Uint32("uid", m.UID).Msg("Failed to reconcile moved message, falling back to upsert")
+		}
+		if !reconciled {
+			// Save to store immediately (don't wait for all messages)
+			if err := e.messageStore.Upsert(m); err != nil {
+				e.log.Warn().Err(err).Uint32("uid", m.UID).Msg("Failed to save message header")
+				continue
+			}
 		}
 		savedMessages = append(savedMessages, m)
 		fetchedCount++

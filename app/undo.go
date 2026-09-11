@@ -156,14 +156,43 @@ func (a *App) DeleteLocalMessages(messageIDs []string) error {
 	return err
 }
 
-// FindLocalMessageIDs implements undo.UndoContext
-// Finds current local DB message IDs by RFC822 Message-ID header and folder
-func (a *App) FindLocalMessageIDs(accountID, folderID string, rfc822MessageIDs []string) ([]string, error) {
-	return a.messageStore.GetIDsByMessageIDs(accountID, folderID, rfc822MessageIDs)
+// ResolveMessagesInFolder implements undo.UndoContext.
+//
+// The local ids are the fast path: they survive a move because the destination
+// sync rebinds the parked row instead of replacing it. Only ids that no longer
+// resolve to a row in folderID fall back to the RFC822 Message-ID lookup — a
+// message with no Message-ID header, or one whose parked row was reaped before
+// the server reported the copy.
+func (a *App) ResolveMessagesInFolder(accountID, folderID string, localIDs, rfc822MessageIDs []string) ([]string, error) {
+	resolved, err := a.messageStore.FilterIDsInFolder(folderID, localIDs)
+	if err != nil {
+		return nil, err
+	}
+	if len(resolved) == len(localIDs) {
+		return resolved, nil
+	}
+
+	byID, err := a.messageStore.GetIDsByMessageIDs(accountID, folderID, rfc822MessageIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	seen := make(map[string]bool, len(resolved))
+	for _, id := range resolved {
+		seen[id] = true
+	}
+	for _, id := range byID {
+		if !seen[id] {
+			seen[id] = true
+			resolved = append(resolved, id)
+		}
+	}
+	return resolved, nil
 }
 
-// MoveMessagesToFolder implements undo.UndoContext
+// MoveMessagesToFolderWithoutUndo implements undo.UndoContext.
 // Delegates to the standard MoveToFolder pipeline (IMAP + local DB + events)
-func (a *App) MoveMessagesToFolder(messageIDs []string, destFolderID string) error {
-	return a.MoveToFolder(messageIDs, destFolderID)
+// with undo recording suppressed — an undo must not be undoable itself.
+func (a *App) MoveMessagesToFolderWithoutUndo(messageIDs []string, destFolderID string) error {
+	return a.moveToFolder(messageIDs, destFolderID, false)
 }
