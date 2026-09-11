@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	goSync "sync"
+	"sync/atomic"
 	"time"
 
 	extcalendarbe "github.com/hkdb/aerion/extensions/calendar/backend"
@@ -192,6 +193,12 @@ type App struct {
 	*extcalendarbe.CalendarBridge
 
 	ctx context.Context
+
+	// Set once the webview is being torn down. Wails delivers events by
+	// evaluating JavaScript inside the webview, so any emit after this point
+	// hits a destroyed WebKitWebView and GTK logs a CRITICAL assertion.
+	// Consulted by emitUI; see its comment.
+	uiTornDown atomic.Bool
 
 	// ready is the backend-up signal the frontend polls before mounting the
 	// main app. False until Startup completes. The boot splash in
@@ -526,6 +533,26 @@ const undoRetention = 5 * time.Minute
 // data loss.
 const opFlushTimeout = 10 * time.Second
 
+// emitUI delivers a Wails event to the frontend, unless the webview is already
+// gone.
+//
+// Wails implements EventsEmit by evaluating JavaScript in the webview. Once
+// shutdown has begun that webview is being destroyed, and every late emit
+// produces:
+//
+//	CRITICAL: webkitWebViewEvaluateJavascriptInternal: assertion
+//	'WEBKIT_IS_WEB_VIEW(webView)' failed
+//
+// Background work can always outlive the window — a sync finishing, a queued
+// operation draining, a folder count landing — so the guard lives here at the
+// single choke point rather than at each of the call sites.
+func (a *App) emitUI(event string, optionalData ...interface{}) {
+	if a.uiTornDown.Load() {
+		return
+	}
+	wailsRuntime.EventsEmit(a.ctx, event, optionalData...)
+}
+
 // shuttingDown tracks if shutdown has been initiated to prevent multiple triggers
 var shuttingDown bool
 
@@ -625,7 +652,7 @@ func (a *App) Startup(ctx context.Context) {
 
 	// Set up sync progress callback to emit events to frontend
 	a.syncEngine.SetProgressCallback(func(progress sync.SyncProgress) {
-		wailsRuntime.EventsEmit(ctx, "sync:progress", map[string]interface{}{
+		a.emitUI("sync:progress", map[string]interface{}{
 			"accountId": progress.AccountID,
 			"folderId":  progress.FolderID,
 			"fetched":   progress.Fetched,
@@ -805,7 +832,7 @@ func (a *App) Startup(ctx context.Context) {
 	// the normal case, IsReady for the "event fired before listener
 	// registered" race.
 	a.ready = true
-	wailsRuntime.EventsEmit(a.ctx, "app:ready")
+	a.emitUI("app:ready")
 
 	// Initialize desktop notifications with click handling
 	a.initNotifications(ctx)
@@ -822,7 +849,7 @@ func (a *App) Startup(ctx context.Context) {
 		if total > 0 {
 			percentage = (indexed * 100) / total
 		}
-		wailsRuntime.EventsEmit(ctx, "fts:progress", map[string]interface{}{
+		a.emitUI("fts:progress", map[string]interface{}{
 			"folderId":   folderID,
 			"indexed":    indexed,
 			"total":      total,
@@ -831,7 +858,7 @@ func (a *App) Startup(ctx context.Context) {
 	})
 
 	a.ftsIndexer.SetCompleteCallback(func(folderID string) {
-		wailsRuntime.EventsEmit(ctx, "fts:complete", map[string]interface{}{
+		a.emitUI("fts:complete", map[string]interface{}{
 			"folderId": folderID,
 		})
 	})
@@ -841,14 +868,14 @@ func (a *App) Startup(ctx context.Context) {
 		defer recoverPanic("app", "FTS indexing")
 		time.Sleep(5 * time.Second)
 		log.Info().Msg("Starting background FTS indexing")
-		wailsRuntime.EventsEmit(ctx, "fts:indexing", map[string]interface{}{
+		a.emitUI("fts:indexing", map[string]interface{}{
 			"status": "started",
 		})
 		if err := a.ftsIndexer.IndexAllFolders(ctx); err != nil {
 			log.Error().Err(err).Msg("Background FTS indexing failed")
 		} else {
 			log.Info().Msg("Background FTS indexing completed")
-			wailsRuntime.EventsEmit(ctx, "fts:indexing", map[string]interface{}{
+			a.emitUI("fts:indexing", map[string]interface{}{
 				"status": "completed",
 			})
 		}
@@ -896,7 +923,7 @@ func (a *App) BeforeClose(ctx context.Context) bool {
 	shuttingDown = true
 
 	// Emit event to show shutdown overlay
-	wailsRuntime.EventsEmit(a.ctx, "app:shutting-down")
+	a.emitUI("app:shutting-down")
 
 	// Schedule actual quit after UI has time to render
 	go func() {
@@ -927,7 +954,7 @@ func (a *App) ShowWindow() {
 	a.windowHidden = false
 
 	// Emit event so frontend can also attempt to focus
-	wailsRuntime.EventsEmit(a.ctx, "window:show")
+	a.emitUI("window:show")
 }
 
 // CloseWindow handles the window close button click.
@@ -951,7 +978,7 @@ func (a *App) CloseWindow() {
 
 	log := logging.WithComponent("app")
 	log.Info().Msg("Window close requested, shutting down")
-	wailsRuntime.EventsEmit(a.ctx, "app:shutting-down")
+	a.emitUI("app:shutting-down")
 	go func() {
 		defer recoverPanic("app", "shutdown")
 		time.Sleep(150 * time.Millisecond)
@@ -969,7 +996,7 @@ func (a *App) QuitApp() {
 
 	log := logging.WithComponent("app")
 	log.Info().Msg("Quit requested")
-	wailsRuntime.EventsEmit(a.ctx, "app:shutting-down")
+	a.emitUI("app:shutting-down")
 	go func() {
 		defer recoverPanic("app", "shutdown")
 		time.Sleep(150 * time.Millisecond)
@@ -1003,6 +1030,11 @@ func (a *App) InitiateShutdown() {
 // Shutdown is called when the app is closing
 func (a *App) Shutdown(ctx context.Context) {
 	log := logging.WithComponent("app")
+
+	// Nothing may reach the frontend from here on: the webview is being
+	// destroyed, and the shutdown flush below deliberately runs work that would
+	// otherwise emit. See emitUI.
+	a.uiTornDown.Store(true)
 
 	// Flush queued mutations before anything is torn down. A move or delete
 	// sitting in its defer window has already been applied locally and shown to

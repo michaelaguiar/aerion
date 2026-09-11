@@ -6,7 +6,6 @@ import (
 	"sync"
 
 	coreapi "github.com/hkdb/aerion/internal/core/api/v1"
-	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 // eventBusCoreImpl is the host implementation of coreapi.EventBus. It serves
@@ -15,7 +14,7 @@ import (
 //  1. Go-side subscribers — extensions that call core.Events().Subscribe(name,
 //     handler) get fan-out as in-process function calls. Used by the calendar
 //     extension's Syncer to listen for `system:wake` and `system:network-online`.
-//  2. Frontend — every Publish also calls wailsRuntime.EventsEmit so the
+//  2. Frontend — every Publish also emits to the webview (via emitUI) so the
 //     Svelte side can subscribe to the same event names via EventsOn().
 //
 // System-event publishing (`system:wake`, `system:network-online`): the host's
@@ -82,7 +81,7 @@ func (e *eventBusCoreImpl) Publish(name string, payload any) error {
 		return nil
 	}
 	if e.app.ctx != nil {
-		wailsRuntime.EventsEmit(e.app.ctx, name, payload)
+		e.app.emitUI(name, payload)
 	}
 	return nil
 }
