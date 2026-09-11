@@ -543,7 +543,11 @@ const undoRetention = 5 * time.Minute
 // to reach the server. Anything still queued past this survives in the
 // database and runs at next startup, so the cost of giving up is delay, not
 // data loss.
-const opFlushTimeout = 10 * time.Second
+const opFlushTimeout = 5 * time.Second
+
+// opStopTimeout bounds the wait for the background drain loop to finish
+// whatever it is in the middle of before the flush takes over.
+const opStopTimeout = 3 * time.Second
 
 // emitUI delivers a Wails event to the frontend, unless the webview is already
 // gone.
@@ -560,6 +564,11 @@ const opFlushTimeout = 10 * time.Second
 // single choke point rather than at each of the call sites.
 func (a *App) emitUI(event string, optionalData ...interface{}) {
 	if a.uiTornDown.Load() {
+		// Logged so a stray critical during teardown can be attributed: if the
+		// assertion fires without a matching drop here, the JavaScript is
+		// coming from something other than an event emit.
+		log := logging.WithComponent("app")
+		log.Debug().Str("event", event).Msg("Dropped event; webview is gone")
 		return
 	}
 	wailsRuntime.EventsEmit(a.ctx, event, optionalData...)
@@ -938,17 +947,29 @@ func (a *App) BeforeClose(ctx context.Context) bool {
 	shuttingDown = true
 
 	// Emit event to show shutdown overlay
-	a.emitUI("app:shutting-down")
-
-	// Schedule actual quit after UI has time to render
-	go func() {
-		defer recoverPanic("app", "shutdown")
-		time.Sleep(150 * time.Millisecond)
-		wailsRuntime.Quit(a.ctx)
-	}()
+	a.beginQuit()
 
 	// Prevent immediate close
 	return true
+}
+
+// beginQuit shows the shutdown overlay, then tears the app down.
+//
+// The ordering matters. Wails destroys the webview inside Quit, while
+// OnShutdown (App.Shutdown) does not run until afterwards — so a guard set
+// there is set too late, and anything emitting in between evaluates JS against
+// a destroyed WebKitWebView. uiTornDown is therefore raised here, immediately
+// before Quit: the overlay is the last thing the frontend needs to hear about.
+func (a *App) beginQuit() {
+	a.emitUI("app:shutting-down")
+
+	go func() {
+		defer recoverPanic("app", "shutdown")
+		// Give the overlay a frame to render before the window goes away.
+		time.Sleep(150 * time.Millisecond)
+		a.uiTornDown.Store(true)
+		wailsRuntime.Quit(a.ctx)
+	}()
 }
 
 // NotifyStartupComplete signals the desktop environment that startup is done.
@@ -993,12 +1014,7 @@ func (a *App) CloseWindow() {
 
 	log := logging.WithComponent("app")
 	log.Info().Msg("Window close requested, shutting down")
-	a.emitUI("app:shutting-down")
-	go func() {
-		defer recoverPanic("app", "shutdown")
-		time.Sleep(150 * time.Millisecond)
-		wailsRuntime.Quit(a.ctx)
-	}()
+	a.beginQuit()
 }
 
 // QuitApp forces a real quit, bypassing background mode.
@@ -1011,12 +1027,7 @@ func (a *App) QuitApp() {
 
 	log := logging.WithComponent("app")
 	log.Info().Msg("Quit requested")
-	a.emitUI("app:shutting-down")
-	go func() {
-		defer recoverPanic("app", "shutdown")
-		time.Sleep(150 * time.Millisecond)
-		wailsRuntime.Quit(a.ctx)
-	}()
+	a.beginQuit()
 }
 
 // GetStartHiddenActive returns true if the window should remain hidden on startup.
@@ -1056,6 +1067,13 @@ func (a *App) Shutdown(ctx context.Context) {
 	// the user; dropping it on exit would let the next sync resurrect the
 	// message. Bounded so a dead server can't block quitting.
 	if a.opDrainer != nil {
+		// Stop the background loop first so the flush is the only thing
+		// executing ops; two of them racing for the IMAP pool is the last
+		// thing a process trying to exit needs.
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), opStopTimeout)
+		a.opDrainer.Stop(stopCtx)
+		stopCancel()
+
 		if n, err := a.opStore.PendingCount(); err == nil && n > 0 {
 			log.Info().Int("count", n).Msg("Flushing queued mailbox operations before shutdown")
 			flushCtx, cancel := context.WithTimeout(context.Background(), opFlushTimeout)
